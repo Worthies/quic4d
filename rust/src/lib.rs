@@ -5,6 +5,7 @@ pub mod core;
 pub mod convenience;
 pub mod models;
 pub mod errors;
+mod runtime;
 mod frb_generated;
 
 // Re-export convenience API for easy access

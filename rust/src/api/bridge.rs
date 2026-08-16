@@ -14,11 +14,16 @@ use crate::errors::{QuicError, QuicWriteException, QuicReadException, QuicReadTo
 
 
 /// Create a new QUIC client endpoint
+///
+/// Runs on the process-lifetime shared runtime (see crate::runtime), not a
+/// throwaway one — quinn::Endpoint::client spawns its I/O driver task onto
+/// whichever Tokio runtime is current at construction time, and dropping
+/// that runtime right after (as a locally-created `Runtime::new()` would
+/// be, once this function returns) kills the driver. The endpoint handle
+/// itself survives, but every later `connect()` call on it then fails
+/// fast with `ConnectError::EndpointStopping`.
 pub fn create_client_endpoint() -> Result<QuicEndpoint, QuicError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
-    
-    rt.block_on(async {
+    crate::runtime::shared_runtime().block_on(async {
         QuicEndpoint::client()
     })
 }
@@ -29,15 +34,15 @@ pub fn create_client_endpoint() -> Result<QuicEndpoint, QuicError> {
 ///   ca_roots:   DER-encoded CA certificates the server must chain to.
 ///   cert_chain: DER-encoded client certificate chain (leaf first).
 ///   client_key: DER-encoded PKCS#8 client private key.
+///
+/// See create_client_endpoint's doc comment for why this must run on the
+/// shared runtime rather than a throwaway one.
 pub fn create_client_endpoint_with_cert(
     ca_roots: Vec<Vec<u8>>,
     cert_chain: Vec<Vec<u8>>,
     client_key: Vec<u8>,
 ) -> Result<QuicEndpoint, QuicError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
-
-    rt.block_on(async {
+    crate::runtime::shared_runtime().block_on(async {
         QuicEndpoint::client_with_cert(ca_roots, cert_chain, client_key)
     })
 }
@@ -288,21 +293,19 @@ pub fn _expose_recv_stream_type(stream: QuicRecvStream) -> QuicRecvStream {
 // Convenience API exposure functions
 
 /// Create a new QuicClient with default configuration
+///
+/// See create_client_endpoint's doc comment (this file) for why endpoint
+/// construction must run on the process-lifetime shared runtime rather
+/// than a throwaway one.
 pub fn quic_client_create() -> Result<QuicClient, QuicError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
-    
-    rt.block_on(async {
+    crate::runtime::shared_runtime().block_on(async {
         QuicClient::create()
     })
 }
 
 /// Create a new QuicClient with custom configuration
 pub fn quic_client_create_with_config(config: QuicClientConfig) -> Result<QuicClient, QuicError> {
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
-    
-    rt.block_on(async {
+    crate::runtime::shared_runtime().block_on(async {
         QuicClient::create_with_config(config)
     })
 }

@@ -14,10 +14,14 @@ pub struct QuicEndpoint {
 impl QuicEndpoint {
     /// Create a new server endpoint with the given configuration
     pub fn server(config: crate::core::config::QuicServerConfig, addr: String) -> Result<Self, QuicError> {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
-        
-        rt.block_on(async {
+        // Must run on the process-lifetime shared runtime (see
+        // crate::runtime), not a throwaway one — quinn::Endpoint::server
+        // spawns its I/O driver task onto whichever runtime is current at
+        // construction time, and dropping that runtime immediately after
+        // (as a locally-created `Runtime::new()` would be) kills the
+        // driver, leaving every later call on this endpoint failing with
+        // ConnectError::EndpointStopping.
+        crate::runtime::shared_runtime().block_on(async {
             let addr: SocketAddr = addr.parse()
                 .map_err(|e| QuicError::Config(format!("Invalid address: {:?}", e)))?;
             

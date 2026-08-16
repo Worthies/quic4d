@@ -17,6 +17,22 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 Future<QuicEndpoint> createClientEndpoint() =>
     RustLib.instance.api.crateApiBridgeCreateClientEndpoint();
 
+/// Create a new QUIC client endpoint with mutual TLS (mTLS): presents a
+/// client certificate to the server and verifies the server against the
+/// given CA roots. All byte inputs are DER-encoded:
+///   ca_roots:   DER-encoded CA certificates the server must chain to.
+///   cert_chain: DER-encoded client certificate chain (leaf first).
+///   client_key: DER-encoded PKCS#8 client private key.
+Future<QuicEndpoint> createClientEndpointWithCert({
+  required List<Uint8List> caRoots,
+  required List<Uint8List> certChain,
+  required List<int> clientKey,
+}) => RustLib.instance.api.crateApiBridgeCreateClientEndpointWithCert(
+  caRoots: caRoots,
+  certChain: certChain,
+  clientKey: clientKey,
+);
+
 /// Create a new QUIC server endpoint
 Future<QuicEndpoint> createServerEndpoint({
   required QuicServerConfig config,

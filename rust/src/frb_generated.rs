@@ -42,7 +42,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.11.1";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1226864594;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1723704596;
 
 // Section: executor
 
@@ -754,6 +754,45 @@ fn wire__crate__api__bridge__create_client_endpoint_impl(
             move |context| {
                 transform_result_sse::<_, crate::errors::QuicError>((move || {
                     let output_ok = crate::api::bridge::create_client_endpoint()?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__bridge__create_client_endpoint_with_cert_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "create_client_endpoint_with_cert",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_ca_roots = <Vec<Vec<u8>>>::sse_decode(&mut deserializer);
+            let api_cert_chain = <Vec<Vec<u8>>>::sse_decode(&mut deserializer);
+            let api_client_key = <Vec<u8>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::errors::QuicError>((move || {
+                    let output_ok = crate::api::bridge::create_client_endpoint_with_cert(
+                        api_ca_roots,
+                        api_cert_chain,
+                        api_client_key,
+                    )?;
                     Ok(output_ok)
                 })())
             }
@@ -2384,66 +2423,72 @@ fn pde_ffi_dispatcher_primary_impl(
         20 => {
             wire__crate__api__bridge__create_client_endpoint_impl(port, ptr, rust_vec_len, data_len)
         }
-        21 => {
+        21 => wire__crate__api__bridge__create_client_endpoint_with_cert_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        22 => {
             wire__crate__api__bridge__create_server_endpoint_impl(port, ptr, rust_vec_len, data_len)
         }
-        22 => wire__crate__api__bridge__endpoint_config_new_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__bridge__endpoint_connect_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__bridge__init_app_impl(port, ptr, rust_vec_len, data_len),
-        25 => {
+        23 => wire__crate__api__bridge__endpoint_config_new_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__bridge__endpoint_connect_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__bridge__init_app_impl(port, ptr, rust_vec_len, data_len),
+        26 => {
             wire__crate__api__bridge__quic_client_clear_pool_impl(port, ptr, rust_vec_len, data_len)
         }
-        26 => wire__crate__api__bridge__quic_client_config_impl(port, ptr, rust_vec_len, data_len),
-        27 => {
+        27 => wire__crate__api__bridge__quic_client_config_impl(port, ptr, rust_vec_len, data_len),
+        28 => {
             wire__crate__api__bridge__quic_client_config_new_impl(port, ptr, rust_vec_len, data_len)
         }
-        28 => wire__crate__api__bridge__quic_client_create_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__bridge__quic_client_create_with_config_impl(
+        29 => wire__crate__api__bridge__quic_client_create_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__bridge__quic_client_create_with_config_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        30 => wire__crate__api__bridge__quic_client_get_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__bridge__quic_client_get_with_timeout_impl(
+        31 => wire__crate__api__bridge__quic_client_get_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__bridge__quic_client_get_with_timeout_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        32 => wire__crate__api__bridge__quic_client_post_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__bridge__quic_client_post_with_timeout_impl(
+        33 => wire__crate__api__bridge__quic_client_post_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__bridge__quic_client_post_with_timeout_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        34 => wire__crate__api__bridge__quic_client_send_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__bridge__quic_client_send_with_timeout_impl(
+        35 => wire__crate__api__bridge__quic_client_send_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__bridge__quic_client_send_with_timeout_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        36 => wire__crate__api__bridge__recv_stream_read_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__bridge__recv_stream_read_to_end_impl(
+        37 => wire__crate__api__bridge__recv_stream_read_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__bridge__recv_stream_read_to_end_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        38 => wire__crate__api__bridge__send_stream_finish_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__bridge__send_stream_write_impl(port, ptr, rust_vec_len, data_len),
-        40 => {
+        39 => wire__crate__api__bridge__send_stream_finish_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__bridge__send_stream_write_impl(port, ptr, rust_vec_len, data_len),
+        41 => {
             wire__crate__api__bridge__send_stream_write_all_impl(port, ptr, rust_vec_len, data_len)
         }
-        41 => wire__crate__api__bridge__server_config_with_single_cert_impl(
+        42 => wire__crate__api__bridge__server_config_with_single_cert_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        42 => {
+        43 => {
             wire__crate__api__bridge__transport_config_new_impl(port, ptr, rust_vec_len, data_len)
         }
         _ => unreachable!(),

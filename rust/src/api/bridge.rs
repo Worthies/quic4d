@@ -23,6 +23,25 @@ pub fn create_client_endpoint() -> Result<QuicEndpoint, QuicError> {
     })
 }
 
+/// Create a new QUIC client endpoint with mutual TLS (mTLS): presents a
+/// client certificate to the server and verifies the server against the
+/// given CA roots. All byte inputs are DER-encoded:
+///   ca_roots:   DER-encoded CA certificates the server must chain to.
+///   cert_chain: DER-encoded client certificate chain (leaf first).
+///   client_key: DER-encoded PKCS#8 client private key.
+pub fn create_client_endpoint_with_cert(
+    ca_roots: Vec<Vec<u8>>,
+    cert_chain: Vec<Vec<u8>>,
+    client_key: Vec<u8>,
+) -> Result<QuicEndpoint, QuicError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| QuicError::Endpoint(format!("Failed to create runtime: {:?}", e)))?;
+
+    rt.block_on(async {
+        QuicEndpoint::client_with_cert(ca_roots, cert_chain, client_key)
+    })
+}
+
 /// Create a new QUIC server endpoint
 pub fn create_server_endpoint(config: QuicServerConfig, addr: String) -> Result<QuicEndpoint, QuicError> {
     QuicEndpoint::server(config, addr)

@@ -62,6 +62,65 @@ impl QuicEndpoint {
         
         Ok(Self { inner: endpoint })
     }
+
+    /// Create a new client endpoint with mutual TLS (mTLS) — presents a
+    /// client certificate to the server and verifies the server against the
+    /// given CA roots. All inputs are DER-encoded:
+    ///   ca_roots:    DER-encoded CA certificates the server must chain to.
+    ///   cert_chain:  DER-encoded client certificate chain (leaf first).
+    ///   client_key:  DER-encoded PKCS#8 client private key.
+    pub fn client_with_cert(
+        ca_roots: Vec<Vec<u8>>,
+        cert_chain: Vec<Vec<u8>>,
+        client_key: Vec<u8>,
+    ) -> Result<Self, QuicError> {
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+        // Ensure crypto provider is installed
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| QuicError::Config("Failed to install default crypto provider".to_string()))?;
+        }
+
+        // Build the root store the server certificate is verified against.
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in ca_roots {
+            roots
+                .add(CertificateDer::from(ca))
+                .map_err(|e| QuicError::Config(format!("Invalid CA certificate: {:?}", e)))?;
+        }
+
+        // Convert the client cert chain + key to DER types.
+        let cert_chain: Vec<CertificateDer> = cert_chain
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect();
+        let client_key = PrivateKeyDer::try_from(client_key)
+            .map_err(|e| QuicError::Config(format!("Invalid client private key: {:?}", e)))?;
+
+        let crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(cert_chain, client_key)
+            .map_err(|e| QuicError::Config(format!("Failed to create mTLS client config: {:?}", e)))?;
+
+        let mut config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                .map_err(|e| QuicError::Config(format!("Failed to create QUIC client config: {:?}", e)))?
+        ));
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(100u32.into());
+        transport.max_concurrent_uni_streams(100u32.into());
+        config.transport_config(Arc::new(transport));
+
+        let mut endpoint = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+            .map_err(|e| QuicError::Endpoint(format!("Failed to create client endpoint: {:?}", e)))?;
+
+        endpoint.set_default_client_config(config);
+
+        Ok(Self { inner: endpoint })
+    }
     
     /// Connect to a server
     pub async fn connect(&self, addr: String, server_name: String) -> Result<QuicConnection, QuicError> {

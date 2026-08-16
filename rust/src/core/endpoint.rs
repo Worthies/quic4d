@@ -104,6 +104,11 @@ impl QuicEndpoint {
             .with_client_auth_cert(cert_chain, client_key)
             .map_err(|e| QuicError::Config(format!("Failed to create mTLS client config: {:?}", e)))?;
 
+        // ALPN must match the server (see server/quic_visitor.go's
+        // NextProtos = ["leaf-commander"]) or the QUIC TLS handshake fails.
+        let mut crypto = crypto;
+        crypto.alpn_protocols = vec![b"leaf-commander".to_vec()];
+
         let mut config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|e| QuicError::Config(format!("Failed to create QUIC client config: {:?}", e)))?

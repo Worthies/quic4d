@@ -5,10 +5,43 @@ use crate::core::connection::QuicConnection;
 use crate::errors::QuicError;
 use std::net::{SocketAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[frb(opaque)]
 pub struct QuicEndpoint {
     inner: quinn::Endpoint,
+}
+
+/// Sets a keep-alive interval and a matching max idle timeout on a client
+/// TransportConfig, applied to every client endpoint this module builds
+/// (both the insecure `client()` and the mTLS `client_with_cert()` path).
+///
+/// Quinn's TransportConfig defaults `keep_alive_interval` to `None` (no
+/// keepalive traffic at all) with a 30s `max_idle_timeout`. Without any
+/// keepalive, a connection that goes quiet for a while (no chat activity)
+/// sends zero QUIC-level traffic — and since QUIC rides on UDP, a NAT or
+/// firewall between client and server (very common on the mobile/
+/// cellular links commander connects over) can silently expire its UDP
+/// port mapping well before either side notices. The connection then
+/// looks alive to both peers (no error, no close) right up until an
+/// actual write is attempted, which fails once the server's own
+/// visitorWriteTimeout elapses — this was diagnosed as the cause of the
+/// server's repeating "[ASYNC SEND] Error sending to commander@...:
+/// deadline exceeded" log entries specifically for commander's QUIC
+/// connections (agents' own Go QUIC client and server/quic_visitor.go
+/// already set the equivalent quic-go Config.KeepAlivePeriod for the
+/// exact same reason — see server/quic_visitor.go's quicKeepaliveConfig).
+/// A 10s keep_alive_interval keeps sending traffic often enough to hold
+/// NAT mappings open, and the explicit 30s max_idle_timeout (matching
+/// quinn's own default, set explicitly here so it can't silently drift
+/// if quinn's default ever changes) lets a genuinely dead peer be
+/// detected via idle timeout instead of only being discovered on the
+/// next real write.
+fn apply_keepalive_defaults(transport: &mut quinn::TransportConfig) {
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_secs(30)) {
+        transport.max_idle_timeout(Some(idle));
+    }
 }
 
 impl QuicEndpoint {
@@ -56,6 +89,7 @@ impl QuicEndpoint {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(100u32.into());
         transport.max_concurrent_uni_streams(100u32.into());
+        apply_keepalive_defaults(&mut transport);
         config.transport_config(Arc::new(transport));
         
         // Create endpoint with default socket
@@ -121,6 +155,7 @@ impl QuicEndpoint {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(100u32.into());
         transport.max_concurrent_uni_streams(100u32.into());
+        apply_keepalive_defaults(&mut transport);
         config.transport_config(Arc::new(transport));
 
         let mut endpoint = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))

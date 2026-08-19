@@ -237,6 +237,37 @@ pub fn connection_stats(
     (connection, stats)
 }
 
+/// Close a QUIC connection immediately.
+///
+/// Exposes QuicConnection.close() — see that method's doc comment for why
+/// relying on Dart GC finalization instead is not sufficient for a
+/// long-running client. Unlike most bridge functions here, this does not
+/// hand the connection back: closing is terminal, so returning it would
+/// only invite use-after-close.
+pub fn connection_close(connection: QuicConnection, error_code: u32, reason: String) {
+    connection.close(error_code, reason);
+}
+
+/// Close a QUIC endpoint, its connections, and its UDP socket.
+///
+/// Exposes QuicEndpoint.close() — see that method's doc comment. This is
+/// what actually releases the OS file descriptor and lets the Quinn
+/// driver task finish; an app that builds a new endpoint per reconnect
+/// must call this on the old one or it leaks a socket + task each time.
+pub fn endpoint_close(endpoint: QuicEndpoint, error_code: u32, reason: String) {
+    endpoint.close(error_code, reason);
+}
+
+/// Wait until every connection on a QUIC endpoint has finished closing.
+///
+/// Pair with endpoint_close for a graceful shutdown (so peers observe the
+/// CONNECTION_CLOSE instead of timing out). Returns the endpoint so a
+/// caller that wants to keep inspecting it still can.
+pub async fn endpoint_wait_idle(endpoint: QuicEndpoint) -> QuicEndpoint {
+    endpoint.wait_idle().await;
+    endpoint
+}
+
 // Configuration builder functions
 
 /// Create a new server config with single certificate

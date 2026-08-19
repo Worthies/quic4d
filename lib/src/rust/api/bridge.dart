@@ -14,6 +14,14 @@ import '../models/types.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
 /// Create a new QUIC client endpoint
+///
+/// Runs on the process-lifetime shared runtime (see crate::runtime), not a
+/// throwaway one — quinn::Endpoint::client spawns its I/O driver task onto
+/// whichever Tokio runtime is current at construction time, and dropping
+/// that runtime right after (as a locally-created `Runtime::new()` would
+/// be, once this function returns) kills the driver. The endpoint handle
+/// itself survives, but every later `connect()` call on it then fails
+/// fast with `ConnectError::EndpointStopping`.
 Future<QuicEndpoint> createClientEndpoint() =>
     RustLib.instance.api.crateApiBridgeCreateClientEndpoint();
 
@@ -23,6 +31,9 @@ Future<QuicEndpoint> createClientEndpoint() =>
 ///   ca_roots:   DER-encoded CA certificates the server must chain to.
 ///   cert_chain: DER-encoded client certificate chain (leaf first).
 ///   client_key: DER-encoded PKCS#8 client private key.
+///
+/// See create_client_endpoint's doc comment for why this must run on the
+/// shared runtime rather than a throwaway one.
 Future<QuicEndpoint> createClientEndpointWithCert({
   required List<Uint8List> caRoots,
   required List<Uint8List> certChain,
@@ -205,6 +216,47 @@ Future<(QuicConnection, QuicConnectionStats)> connectionStats({
 }) =>
     RustLib.instance.api.crateApiBridgeConnectionStats(connection: connection);
 
+/// Close a QUIC connection immediately.
+///
+/// Exposes QuicConnection.close() — see that method's doc comment for why
+/// relying on Dart GC finalization instead is not sufficient for a
+/// long-running client. Unlike most bridge functions here, this does not
+/// hand the connection back: closing is terminal, so returning it would
+/// only invite use-after-close.
+Future<void> connectionClose({
+  required QuicConnection connection,
+  required int errorCode,
+  required String reason,
+}) => RustLib.instance.api.crateApiBridgeConnectionClose(
+  connection: connection,
+  errorCode: errorCode,
+  reason: reason,
+);
+
+/// Close a QUIC endpoint, its connections, and its UDP socket.
+///
+/// Exposes QuicEndpoint.close() — see that method's doc comment. This is
+/// what actually releases the OS file descriptor and lets the Quinn
+/// driver task finish; an app that builds a new endpoint per reconnect
+/// must call this on the old one or it leaks a socket + task each time.
+Future<void> endpointClose({
+  required QuicEndpoint endpoint,
+  required int errorCode,
+  required String reason,
+}) => RustLib.instance.api.crateApiBridgeEndpointClose(
+  endpoint: endpoint,
+  errorCode: errorCode,
+  reason: reason,
+);
+
+/// Wait until every connection on a QUIC endpoint has finished closing.
+///
+/// Pair with endpoint_close for a graceful shutdown (so peers observe the
+/// CONNECTION_CLOSE instead of timing out). Returns the endpoint so a
+/// caller that wants to keep inspecting it still can.
+Future<QuicEndpoint> endpointWaitIdle({required QuicEndpoint endpoint}) =>
+    RustLib.instance.api.crateApiBridgeEndpointWaitIdle(endpoint: endpoint);
+
 /// Create a new server config with single certificate
 Future<QuicServerConfig> serverConfigWithSingleCert({
   required List<Uint8List> certChain,
@@ -238,6 +290,10 @@ Future<QuicRecvStream> exposeRecvStreamType({required QuicRecvStream stream}) =>
     RustLib.instance.api.crateApiBridgeExposeRecvStreamType(stream: stream);
 
 /// Create a new QuicClient with default configuration
+///
+/// See create_client_endpoint's doc comment (this file) for why endpoint
+/// construction must run on the process-lifetime shared runtime rather
+/// than a throwaway one.
 Future<QuicClient> quicClientCreate() =>
     RustLib.instance.api.crateApiBridgeQuicClientCreate();
 

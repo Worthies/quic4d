@@ -109,6 +109,26 @@ impl QuicConnection {
         self.inner.close_reason().map(|error| format!("{:?}", error))
     }
 
+    /// Close this connection immediately, telling the peer why.
+    ///
+    /// Without an explicit close, a connection is only torn down when the
+    /// last handle to it is dropped — and on the Dart side that means
+    /// waiting for the GC to finalize the opaque wrapper. That wrapper is
+    /// a single pointer as far as Dart's heap accounting is concerned, so
+    /// it exerts almost no GC pressure while the Rust side still holds
+    /// real per-connection state (send/recv buffers, congestion state) and
+    /// keeps the peer believing the connection is live until its idle
+    /// timeout elapses. A client that reconnects repeatedly therefore
+    /// accumulates dead-but-not-yet-collected connections. Calling this
+    /// makes the teardown deterministic instead.
+    ///
+    /// Idempotent: closing an already-closed connection is a no-op in
+    /// Quinn, so callers don't need to track whether they've closed yet.
+    pub fn close(&self, error_code: u32, reason: String) {
+        self.inner
+            .close(quinn::VarInt::from_u32(error_code), reason.as_bytes());
+    }
+
     /// Get connection statistics
     pub fn stats(&self) -> QuicConnectionStats {
         let quinn_stats = self.inner.stats();

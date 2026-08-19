@@ -184,6 +184,39 @@ impl QuicEndpoint {
     pub(crate) fn inner(&self) -> &quinn::Endpoint {
         &self.inner
     }
+
+    /// Close this endpoint and every connection on it, releasing the
+    /// underlying UDP socket.
+    ///
+    /// This is the important one for long-running clients. Each endpoint
+    /// owns a bound UDP socket (an OS file descriptor) and a Quinn driver
+    /// task spawned onto the process-lifetime shared runtime (see
+    /// crate::runtime) — and because that runtime is deliberately never
+    /// dropped, nothing reclaims the driver on its own. Dropping the Dart
+    /// handle alone doesn't help either: the opaque wrapper is pointer-
+    /// sized, so it creates negligible GC pressure and may not be
+    /// finalized for a very long time, while the socket and driver stay
+    /// alive the whole time. An app that creates a fresh endpoint per
+    /// reconnect (the natural pattern) leaks one socket + one driver task
+    /// per attempt, which adds up quickly on a flaky link.
+    ///
+    /// Idempotent, and safe to call while connections are still open —
+    /// they are closed with the given code/reason first. Note this does
+    /// NOT wait for in-flight close frames to be flushed to peers; use
+    /// wait_idle for that when a graceful shutdown matters.
+    pub fn close(&self, error_code: u32, reason: String) {
+        self.inner
+            .close(quinn::VarInt::from_u32(error_code), reason.as_bytes());
+    }
+
+    /// Wait until every connection on this endpoint is fully closed.
+    ///
+    /// Pair with close() when a graceful shutdown matters (so peers
+    /// actually observe the CONNECTION_CLOSE rather than timing out); on
+    /// its own this only waits, it does not initiate any close.
+    pub async fn wait_idle(&self) {
+        self.inner.wait_idle().await;
+    }
 }
 
 /// Skip server certificate verification for testing purposes

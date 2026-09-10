@@ -43,6 +43,28 @@ class ConnectionException implements Exception {
 /// expand every Initial-packet-carrying datagram to.
 const int kMinimumInitialDatagramSize = 1200;
 
+/// Largest STREAM-frame payload [QuicStream.write] will place in a
+/// single 1-RTT packet. RFC 9000 places no protocol-level limit on a
+/// STREAM frame's data length short of the packet it travels in, but
+/// nothing in this library (or the UDP layer beneath it) fragments an
+/// oversized packet -- a single write() call used to build ONE packet
+/// containing the ENTIRE payload, however large. That is invisible for
+/// short chat messages but breaks completely for anything past roughly
+/// a kilobyte: real quic-go peers silently ignore packets whose UDP
+/// datagram exceeds the negotiated max_udp_payload_size, and a payload
+/// anywhere near 64KB blows straight through the OS's own UDP
+/// `sendto()` limit (`EMSGSIZE`) before even reaching the network --
+/// both reproduced live against server/quic_visitor.go's real
+/// quic-go-based server (see test/integration/large_write_test.dart).
+/// [write] instead splits [data] into chunks of at most this many
+/// bytes, one STREAM frame/packet per chunk, matching how every real
+/// QUIC stack paces stream data across multiple packets. Deliberately
+/// well under [kMinimumMaxDatagramSize] to leave headroom for the
+/// short header, AEAD tag, and STREAM frame's own type/streamId/
+/// offset/length varints, without needing to compute that overhead
+/// exactly per chunk.
+const int kMaxStreamFrameChunkSize = 1000;
+
 enum ConnectionState { connecting, handshaking, connected, closed }
 
 /// A single client-initiated bidirectional stream -- DESIGN.md's entire
@@ -67,14 +89,31 @@ class QuicStream {
   /// existing MTLSClient/QuicClient transports).
   Stream<Uint8List> get incoming => _incomingController.stream;
 
+  /// Sends [data] on this stream, transparently splitting it across
+  /// multiple STREAM frames/packets of at most
+  /// [kMaxStreamFrameChunkSize] bytes each -- see that constant's doc
+  /// for why a single write() call used to silently fail for anything
+  /// much bigger than a short chat message. Each chunk still carries
+  /// its own correct offset, so the receiver's existing offset-based
+  /// reassembly ([_handleFrame]/[_drainOutOfOrder]) needs no changes:
+  /// chunks arrive (and are delivered to [incoming]) in the same order
+  /// they were sent, one `incoming` event per chunk.
   Future<void> write(Uint8List data) async {
     if (data.isEmpty) return;
-    await _connection._sendStreamData(
-      streamId: clientBidiStreamId0,
-      offset: _sendOffset,
-      data: data,
-    );
-    _sendOffset += data.length;
+    var pos = 0;
+    while (pos < data.length) {
+      final end = (pos + kMaxStreamFrameChunkSize < data.length)
+          ? pos + kMaxStreamFrameChunkSize
+          : data.length;
+      final chunk = Uint8List.sublistView(data, pos, end);
+      await _connection._sendStreamData(
+        streamId: clientBidiStreamId0,
+        offset: _sendOffset,
+        data: chunk,
+      );
+      _sendOffset += chunk.length;
+      pos = end;
+    }
   }
 
   void _handleFrame(StreamFrame frame) {

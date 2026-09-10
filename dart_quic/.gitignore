@@ -6,6 +6,9 @@ pubspec.lock
 
 # Test-only fixture private keys (self-signed, no real-world validity;
 # used solely as golden-test inputs for signature verification, e.g.
-# certificate_verify_sign_roundtrip_test.dart) -- override the parent
-# repo's root .gitignore *.key rule so these are actually tracked.
+# certificate_verify_sign_roundtrip_test.dart, and for the live
+# quic-go interop test's mTLS client/server identities) -- override
+# the parent repo's root .gitignore *.key rule so these are actually
+# tracked.
 !test/fixtures/*.key
+!test/integration/fixtures/*.key

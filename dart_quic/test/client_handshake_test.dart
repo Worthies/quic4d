@@ -136,7 +136,7 @@ void main() {
         tryDecodeHandshakeMessage(serverHelloBytes, 0)!.body);
     expect(parsedForSanity.keyShare!.keyExchange, serverPublicKey);
 
-    await client.feedCryptoData(EncryptionLevel.initial, serverHelloBytes);
+    await client.feedCryptoData(EncryptionLevel.initial, 0, serverHelloBytes);
 
     // ---- Server derives handshake secrets (mirrors key_schedule.dart,
     // independently invoked here, not shared state with the client) ----
@@ -209,6 +209,12 @@ void main() {
         serverFinishedSink, HandshakeType.finished, serverFinishedVerifyData);
     final serverFinishedBytes = serverFinishedSink.toBytes();
     serverTranscript.addMessage(serverFinishedBytes);
+    // RFC 8446 §7.1's key schedule: application traffic secrets are
+    // derived from the transcript "ClientHello...server Finished" --
+    // snapshot here, before the client's own Certificate/
+    // CertificateVerify/Finished get added below, matching
+    // ClientHandshake's own _transcriptHashAtServerFinished.
+    final transcriptAtServerFinished = await serverTranscript.snapshot();
 
     // ---- Feed the whole server flight to the client at once (as if it
     // arrived in one Handshake-level CRYPTO frame) ----
@@ -220,7 +226,7 @@ void main() {
       ..add(serverFinishedBytes);
 
     await client.feedCryptoData(
-        EncryptionLevel.handshake, serverFlight.toBytes());
+        EncryptionLevel.handshake, 0, serverFlight.toBytes());
 
     expect(observedServerChain, isNotNull);
     expect(observedServerChain!.single, serverCertDer);
@@ -281,10 +287,9 @@ void main() {
     serverTranscript.addMessage(_wrap(clientFinishedMsg));
 
     // ---- Application secrets must match on both sides ----
-    final transcriptThroughClientFinished = await serverTranscript.snapshot();
     final serverAppSecrets = await deriveApplicationTrafficSecrets(
       masterSecret: serverSecrets.masterSecret,
-      transcriptHashUpToServerFinished: transcriptThroughClientFinished,
+      transcriptHashUpToServerFinished: transcriptAtServerFinished,
     );
     final clientAppSecrets = client.applicationTrafficSecrets;
     expect(clientAppSecrets.clientSecret,
@@ -331,7 +336,7 @@ void main() {
     encodeHandshakeMessage(
         serverHelloSink, HandshakeType.serverHello, serverHelloBody.toBytes());
     await client.feedCryptoData(
-        EncryptionLevel.initial, serverHelloSink.toBytes());
+        EncryptionLevel.initial, 0, serverHelloSink.toBytes());
 
     final eeSink = BytesBuilder();
     encodeHandshakeMessage(
@@ -347,7 +352,8 @@ void main() {
       ..add(badFinishedSink.toBytes());
 
     expect(
-      () => client.feedCryptoData(EncryptionLevel.handshake, flight.toBytes()),
+      () =>
+          client.feedCryptoData(EncryptionLevel.handshake, 0, flight.toBytes()),
       throwsA(isA<HandshakeException>()),
     );
   });

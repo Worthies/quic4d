@@ -46,6 +46,7 @@ Uint8List buildClientHello({
   required Uint8List quicTransportParameters,
   String? serverName,
   List<int> cipherSuites = CipherSuite.dartQuicOffered,
+  List<String> alpnProtocols = const ['leaf-commander'],
 }) {
   if (random.length != 32) {
     throw ArgumentError('ClientHello random must be exactly 32 bytes');
@@ -80,6 +81,13 @@ Uint8List buildClientHello({
     type: ExtensionType.supportedVersions,
     data: encodeSupportedVersionsClientHello(),
   ));
+
+  if (alpnProtocols.isNotEmpty) {
+    extensions.add(RawExtension(
+      type: ExtensionType.alpn,
+      data: encodeAlpnProtocolList(alpnProtocols),
+    ));
+  }
 
   extensions.add(RawExtension(
     type: ExtensionType.signatureAlgorithms,

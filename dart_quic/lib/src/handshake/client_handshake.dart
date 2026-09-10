@@ -34,6 +34,58 @@ import '../tls/transport_parameters.dart';
 
 enum EncryptionLevel { initial, handshake, oneRtt }
 
+/// Reassembles one encryption level's CRYPTO stream from
+/// possibly-out-of-order, possibly-overlapping/duplicate chunks (see
+/// [ClientHandshake._reassembly]'s doc comment for why duplicates are
+/// expected in practice, not just a theoretical edge case).
+class _ReassemblyState {
+  /// The contiguous stream bytes received so far, from offset 0.
+  Uint8List received = Uint8List(0);
+
+  /// Out-of-order chunks waiting for the gap before them to close,
+  /// keyed by their stream start offset.
+  final Map<int, Uint8List> _pending = {};
+
+  /// How many bytes of [received] have already been consumed into
+  /// decoded handshake messages -- tracked here (rather than trimming
+  /// [received] itself) so a handshake message split across chunk
+  /// boundaries never needs its already-decoded prefix re-parsed.
+  int consumedLength = 0;
+
+  void addChunk(int offset, Uint8List data) {
+    if (offset + data.length <= received.length) {
+      return; // fully-duplicate retransmission of bytes already merged
+    }
+    if (offset > received.length) {
+      _pending[offset] = data; // gap before this chunk -- hold it
+      return;
+    }
+    _mergeChunk(offset, data);
+    _drainPending();
+  }
+
+  void _mergeChunk(int offset, Uint8List data) {
+    final newPartStart = received.length - offset;
+    final newBytes = data.sublist(newPartStart);
+    final merged = Uint8List(received.length + newBytes.length)
+      ..setRange(0, received.length, received)
+      ..setRange(received.length, received.length + newBytes.length, newBytes);
+    received = merged;
+  }
+
+  void _drainPending() {
+    while (true) {
+      final nextOffset = _pending.keys
+          .where((o) => o <= received.length)
+          .fold<int?>(null, (best, o) => best == null || o < best ? o : best);
+      if (nextOffset == null) return;
+      final data = _pending.remove(nextOffset)!;
+      if (nextOffset + data.length <= received.length) continue; // stale
+      _mergeChunk(nextOffset, data);
+    }
+  }
+}
+
 class HandshakeException implements Exception {
   final String message;
   const HandshakeException(this.message);
@@ -100,9 +152,19 @@ class ClientHandshake {
   final TranscriptHash _transcript = TranscriptHash();
   _HandshakeState _state = _HandshakeState.notStarted;
 
-  final Map<EncryptionLevel, List<int>> _inboundBuffer = {
-    EncryptionLevel.initial: [],
-    EncryptionLevel.handshake: [],
+  /// Per-level CRYPTO stream reassembly. [_ReassemblyState.received]
+  /// holds the contiguous stream from offset 0 up to however much has
+  /// arrived so far; [_ReassemblyState.pending] holds out-of-order
+  /// chunks keyed by their stream offset until the gap before them
+  /// closes. quic-go retransmits whole Handshake-level CRYPTO frames
+  /// verbatim (observed empirically against a live server -- see
+  /// test/integration/quic_go_interop_test.dart) while waiting for an
+  /// ACK to release its anti-amplification budget, so overlapping/
+  /// fully-duplicate offset ranges must be tolerated, not just
+  /// straightforward in-order appends.
+  final Map<EncryptionLevel, _ReassemblyState> _reassembly = {
+    EncryptionLevel.initial: _ReassemblyState(),
+    EncryptionLevel.handshake: _ReassemblyState(),
   };
   final Map<EncryptionLevel, BytesBuilder> _outboundBuffer = {
     EncryptionLevel.initial: BytesBuilder(),
@@ -182,13 +244,20 @@ class ClientHandshake {
   }
 
   /// Feeds newly-received CRYPTO frame payload bytes at [level] --
-  /// order within a level must match the CRYPTO stream's byte offsets
-  /// (the caller, connection.dart, is responsible for reassembling
-  /// out-of-order CRYPTO frames before calling this; this class assumes
-  /// a contiguous, in-order byte stream per level, matching RFC 9000
-  /// §19.6's "each encryption level is treated as a separate CRYPTO
-  /// stream of data").
-  Future<void> feedCryptoData(EncryptionLevel level, Uint8List data) async {
+  /// [offset] and [data] come directly from a received CRYPTO frame
+  /// (RFC 9000 §19.6: each encryption level is its own independent
+  /// byte stream, addressed by offset within that stream). Frames can
+  /// arrive out of order, and quic-go has been observed retransmitting
+  /// whole already-delivered frames verbatim while waiting for an ACK
+  /// (see test/integration/quic_go_interop_test.dart) -- both cases
+  /// are handled by keying reassembly on offset and only ever
+  /// processing the contiguous prefix once, rather than assuming
+  /// `data` is always new tail bytes to append.
+  Future<void> feedCryptoData(
+    EncryptionLevel level,
+    int offset,
+    Uint8List data,
+  ) async {
     if (level == EncryptionLevel.oneRtt) {
       // dart_quic's client never expects post-handshake CRYPTO data
       // (no session tickets/NewSessionTicket processing -- see
@@ -197,15 +266,17 @@ class ClientHandshake {
       // just drop.
       return;
     }
-    final buffer = _inboundBuffer[level]!;
-    buffer.addAll(data);
+    if (data.isEmpty) return;
+
+    final state = _reassembly[level]!;
+    state.addChunk(offset, data);
     await _processBufferedMessages(level);
   }
 
   Future<void> _processBufferedMessages(EncryptionLevel level) async {
-    final buffer = _inboundBuffer[level]!;
-    var bytes = Uint8List.fromList(buffer);
-    var consumedTotal = 0;
+    final state = _reassembly[level]!;
+    final bytes = state.received;
+    var consumedTotal = state.consumedLength;
 
     while (true) {
       final message = tryDecodeHandshakeMessage(bytes, consumedTotal);
@@ -213,10 +284,7 @@ class ClientHandshake {
       await _handleMessage(level, message);
       consumedTotal += message.totalLength;
     }
-
-    if (consumedTotal > 0) {
-      buffer.removeRange(0, consumedTotal);
-    }
+    state.consumedLength = consumedTotal;
   }
 
   Future<void> _handleMessage(
@@ -247,6 +315,12 @@ class ClientHandshake {
       case HandshakeType.finished:
         await _handleServerFinished(message);
         _transcript.addMessage(fullMessageBytes);
+        // RFC 8446 §7.1: application traffic secrets are derived from
+        // the transcript "ClientHello...server Finished" -- i.e.
+        // *including* this Finished message, which must be added to
+        // the transcript (the line above) before this snapshot, not
+        // before it.
+        _transcriptHashAtServerFinished = await _transcript.snapshot();
         await _sendClientFlight();
       default:
         throw HandshakeException(
@@ -347,6 +421,8 @@ class ClientHandshake {
     _state = _HandshakeState.receivedServerFlight;
   }
 
+  Uint8List? _transcriptHashAtServerFinished;
+
   Future<void> _sendClientFlight() async {
     final identity = clientIdentity;
     final certRequested = _certificateRequest != null;
@@ -393,10 +469,9 @@ class ClientHandshake {
     _transcript.addMessage(finishedBytes);
     _outboundBuffer[EncryptionLevel.handshake]!.add(finishedBytes);
 
-    final transcriptHashAfterFinished = await _transcript.snapshot();
     _applicationSecrets = await deriveApplicationTrafficSecrets(
       masterSecret: secrets.masterSecret,
-      transcriptHashUpToServerFinished: transcriptHashAfterFinished,
+      transcriptHashUpToServerFinished: _transcriptHashAtServerFinished!,
     );
 
     _state = _HandshakeState.complete;

@@ -168,6 +168,30 @@ KeyShareEntry decodeKeyShareServerHello(Uint8List data) {
   return KeyShareEntry(group: group, keyExchange: keyExchange);
 }
 
+/// Builds the `application_layer_protocol_negotiation` extension's
+/// ClientHello body (RFC 7301 §3.1): a 2-byte list length followed by a
+/// sequence of 1-byte-length-prefixed protocol name strings. QUIC
+/// requires an ALPN value (RFC 9001 §8.1: "endpoints MUST NOT use TLS
+/// without the ALPN extension") -- dart_quic always offers exactly the
+/// single protocol commander's transport already negotiates over TCP+
+/// mTLS and Go's QUIC fast path (`quicNextProto = "leaf-commander"` in
+/// agents/quic_conn.go and server/quic_visitor.go), since this library
+/// exists to interoperate with that one specific server, not to
+/// negotiate an arbitrary ALPN set.
+Uint8List encodeAlpnProtocolList(List<String> protocols) {
+  final listBody = BytesBuilder();
+  for (final protocol in protocols) {
+    final bytes = Uint8List.fromList(protocol.codeUnits);
+    listBody.addByte(bytes.length);
+    listBody.add(bytes);
+  }
+  final listBytes = listBody.toBytes();
+  final sink = BytesBuilder();
+  sink.add(_uint16(listBytes.length));
+  sink.add(listBytes);
+  return sink.toBytes();
+}
+
 /// Builds the `server_name` extension's ClientHello body (RFC 6066
 /// §3, referenced by RFC 8446 §4.2): a 2-byte list length, then one
 /// ServerNameList entry with NameType host_name(0) and a 2-byte

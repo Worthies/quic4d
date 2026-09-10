@@ -55,8 +55,11 @@ Future<InitialSecrets> deriveInitialSecrets(
 }
 
 Future<InitialKeys> _deriveInitialKeys(Uint8List secret) async {
-  final key = await hkdfExpandLabel(secret: secret, label: 'quic key', length: 16);
-  final iv = await hkdfExpandLabel(secret: secret, label: 'quic iv', length: 12);
-  final hp = await hkdfExpandLabel(secret: secret, label: 'quic hp', length: 16);
+  final key =
+      await hkdfExpandLabel(secret: secret, label: 'quic key', length: 16);
+  final iv =
+      await hkdfExpandLabel(secret: secret, label: 'quic iv', length: 12);
+  final hp =
+      await hkdfExpandLabel(secret: secret, label: 'quic hp', length: 16);
   return InitialKeys(key: key, iv: iv, hp: hp);
 }

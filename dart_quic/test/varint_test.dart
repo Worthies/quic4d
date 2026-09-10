@@ -9,8 +9,8 @@ void main() {
     // ("Sample Variable-Length Integer Decoding"), used verbatim as
     // golden vectors rather than invented ones.
     test('8-byte encoding: 0xc2197c5eff14e88c -> 151288809941952652', () {
-      final bytes = Uint8List.fromList(
-          [0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]);
+      final bytes =
+          Uint8List.fromList([0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]);
       final result = readVarInt(bytes, 0);
       expect(result.value, 151288809941952652);
       expect(result.bytesConsumed, 8);
@@ -52,8 +52,7 @@ void main() {
     test('throws on truncated multi-byte varint', () {
       // First byte 0x9d signals a 4-byte encoding but only 2 bytes follow.
       final bytes = Uint8List.fromList([0x9d, 0x7f]);
-      expect(() => readVarInt(bytes, 0),
-          throwsA(isA<VarIntFormatException>()));
+      expect(() => readVarInt(bytes, 0), throwsA(isA<VarIntFormatException>()));
     });
   });
 
@@ -67,15 +66,14 @@ void main() {
     });
 
     test('encodes 494878333 as the canonical 4-byte form', () {
-      expect(
-          encodeVarInt(494878333), Uint8List.fromList([0x9d, 0x7f, 0x3e, 0x7d]));
+      expect(encodeVarInt(494878333),
+          Uint8List.fromList([0x9d, 0x7f, 0x3e, 0x7d]));
     });
 
     test('encodes 151288809941952652 as the canonical 8-byte form', () {
       expect(
         encodeVarInt(151288809941952652),
-        Uint8List.fromList(
-            [0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]),
+        Uint8List.fromList([0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c]),
       );
     });
 
@@ -102,10 +100,17 @@ void main() {
           throwsA(isA<VarIntFormatException>()));
     });
 
-    test('varIntLength matches the length writeVarInt actually produces',
-        () {
-      for (final value in [0, 63, 64, 16383, 16384, 1073741823, 1073741824,
-          maxVarInt]) {
+    test('varIntLength matches the length writeVarInt actually produces', () {
+      for (final value in [
+        0,
+        63,
+        64,
+        16383,
+        16384,
+        1073741823,
+        1073741824,
+        maxVarInt
+      ]) {
         expect(encodeVarInt(value).length, varIntLength(value));
       }
     });

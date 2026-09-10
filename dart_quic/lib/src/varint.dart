@@ -83,8 +83,7 @@ class VarIntResult {
 /// two bits, per RFC 9000 §16 Table 4).
 VarIntResult readVarInt(Uint8List data, int offset) {
   if (offset >= data.length) {
-    throw const VarIntFormatException(
-        'no bytes remaining to decode a varint');
+    throw const VarIntFormatException('no bytes remaining to decode a varint');
   }
   final first = data[offset];
   final lengthBits = first >> 6;

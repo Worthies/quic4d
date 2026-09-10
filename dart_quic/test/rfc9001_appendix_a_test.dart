@@ -63,8 +63,7 @@ void main() {
       expect(unprotectedPayload.length, 1162);
     });
 
-    test('AEAD seal reproduces the exact protected payload bytes',
-        () async {
+    test('AEAD seal reproduces the exact protected payload bytes', () async {
       final secrets = await deriveInitialSecrets(destinationConnectionId);
       final protected = await aeadAes128GcmSeal(
         key: secrets.client.key,
@@ -82,8 +81,7 @@ void main() {
       expect(protected.length, unprotectedPayload.length + 16);
     });
 
-    test('header protection mask matches the RFC worked example',
-        () async {
+    test('header protection mask matches the RFC worked example', () async {
       final secrets = await deriveInitialSecrets(destinationConnectionId);
       final protected = await aeadAes128GcmSeal(
         key: secrets.client.key,
@@ -166,12 +164,12 @@ void main() {
 
       // Now fullPacket[0..packetNumberOffset+pnLength) is the
       // unprotected header again, matching `unprotectedHeader`.
-      final recoveredHeader = Uint8List.sublistView(
-          fullPacket, 0, packetNumberOffset + pnLength);
+      final recoveredHeader =
+          Uint8List.sublistView(fullPacket, 0, packetNumberOffset + pnLength);
       expect(recoveredHeader, unprotectedHeader);
 
-      final protectedPayload = Uint8List.sublistView(
-          fullPacket, packetNumberOffset + pnLength);
+      final protectedPayload =
+          Uint8List.sublistView(fullPacket, packetNumberOffset + pnLength);
       final plaintext = await aeadAes128GcmOpen(
         key: secrets.client.key,
         iv: secrets.client.iv,
@@ -183,7 +181,8 @@ void main() {
       expect(plaintext, unprotectedPayload);
     });
 
-    test('decryption fails (does not throw a different error) on a '
+    test(
+        'decryption fails (does not throw a different error) on a '
         'corrupted tag', () async {
       final secrets = await deriveInitialSecrets(destinationConnectionId);
       final protected = await aeadAes128GcmSeal(

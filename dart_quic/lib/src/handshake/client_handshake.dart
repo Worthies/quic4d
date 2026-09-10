@@ -57,7 +57,14 @@ class _ReassemblyState {
       return; // fully-duplicate retransmission of bytes already merged
     }
     if (offset > received.length) {
-      _pending[offset] = data; // gap before this chunk -- hold it
+      // Gap before this chunk -- hold it. A re-chunked retransmission
+      // may arrive at an offset we already hold a (shorter) entry for;
+      // keep whichever reaches further so a smaller frame can never
+      // shrink the buffered coverage.
+      final existing = _pending[offset];
+      if (existing == null || existing.length < data.length) {
+        _pending[offset] = data;
+      }
       return;
     }
     _mergeChunk(offset, data);

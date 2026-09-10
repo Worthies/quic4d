@@ -27,6 +27,20 @@ import '../frame/ack_frame.dart';
 /// been lost -- always safe, never dishonest).
 const int kMaxAckRanges = 8;
 
+/// Cap on out-of-order packets tracked above the contiguous frontier.
+/// A peer may legally send packet numbers far above the frontier (4-byte
+/// truncated numbers jump up to 2^31), so state growth must be bounded;
+/// untracked packets simply go un-ACKed and are retransmitted by the
+/// peer's loss detection, which is always safe.
+const int kMaxTrackedStragglers = 256;
+
+/// Cap on how far below a run we scan for the next received packet while
+/// building ACK ranges. Bounds buildAckFrame to
+/// O(kMaxAckRanges * (kMaxTrackedStragglers + kMaxGapScan)) steps so a
+/// huge packet-number jump cannot stall the event loop. Gaps beyond the
+/// cap end the ACK early; the skipped packets get retransmitted.
+const int kMaxGapScan = 64;
+
 class ReceivedPacketTracker {
   /// Highest packet number such that EVERY pn in 0..frontier has been
   /// received. -1 = nothing received yet.
@@ -44,6 +58,13 @@ class ReceivedPacketTracker {
   /// duplicate (already known), true if newly recorded.
   bool onReceived(int pn) {
     if (pn <= _frontier) return false;
+    if (_above.length >= kMaxTrackedStragglers && !_above.contains(pn)) {
+      // Untracked (not ACKed): the peer retransmits it later.
+      largestReceived = largestReceived == null || pn > largestReceived!
+          ? pn
+          : largestReceived;
+      return true;
+    }
     if (!_above.add(pn)) return false;
     largestReceived =
         largestReceived == null || pn > largestReceived! ? pn : largestReceived;
@@ -74,12 +95,16 @@ class ReceivedPacketTracker {
     var firstAckRange = _contiguousRunBelow(largest) - 1;
     var lowestInRun = largest - (firstAckRange + 1);
     while (lowestInRun > _frontier && ranges.length < kMaxAckRanges) {
-      // Gap down to the next received packet.
+      // Gap down to the next received packet, bounded by kMaxGapScan so
+      // a huge packet-number jump cannot turn this into a billions-step
+      // scan that stalls the event loop.
       var gapPn = lowestInRun - 1;
-      while (gapPn >= 0 && !contains(gapPn)) {
+      var scanned = 0;
+      while (gapPn >= 0 && !contains(gapPn) && scanned < kMaxGapScan) {
         gapPn--;
+        scanned++;
       }
-      if (gapPn < 0) break; // nothing received below; run ends at 0
+      if (gapPn < 0 || !contains(gapPn)) break;
       // RFC 9000 §19.3.1 + ack_frame.dart's own decoder: the next
       // range's largest = previous range's smallest - gap - 2, i.e.
       // gap = unackedCount - 1 between the two runs (verified by

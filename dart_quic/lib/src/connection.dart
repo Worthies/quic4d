@@ -67,6 +67,91 @@ const int kMaxStreamFrameChunkSize = 1000;
 
 enum ConnectionState { connecting, handshaking, connected, closed }
 
+/// In-order reassembly of one stream's received data from possibly
+/// overlapping, possibly reordered STREAM frames.
+///
+/// Two QUIC realities make this more than "append if offset matches":
+///   1. RFC 9000 §19.8 allows frames to overlap already-received
+///      ranges, and RFC 9002 §7.2.2 lets a peer retransmit stream data
+///      re-chunked under DIFFERENT frame boundaries -- so a frame can
+///      straddle the delivery frontier (start below it, end above) and
+///      must contribute its new tail, never be dropped wholesale.
+///      Dropping it stalled the stream forever: the peer counted those
+///      bytes as delivered and nothing ever re-sent them.
+///   2. Frames above the frontier may arrive in any order and may
+///      themselves overlap each other; buffering keeps whichever
+///      coverage reaches furthest.
+class StreamReassembler {
+  int _receiveOffset = 0;
+  final Map<int, Uint8List> _outOfOrder = {};
+  final void Function(Uint8List data) _deliver;
+
+  StreamReassembler(this._deliver);
+
+  /// How many contiguous bytes (from stream offset 0) have been
+  /// delivered so far.
+  int get receiveOffset => _receiveOffset;
+
+  /// Number of buffered out-of-order entries still held (for tests of
+  /// eviction hygiene -- stale fully-covered entries must not linger).
+  int get pendingEntryCount => _outOfOrder.length;
+
+  void add(int offset, Uint8List data) {
+    if (offset < _receiveOffset) {
+      final skip = _receiveOffset - offset;
+      if (skip >= data.length) return; // fully-duplicate retransmission
+      data = Uint8List.sublistView(data, skip);
+      offset = _receiveOffset;
+    }
+    if (offset == _receiveOffset) {
+      _deliver(data);
+      _receiveOffset += data.length;
+      _drainOutOfOrder();
+      return;
+    }
+    final existing = _outOfOrder[offset];
+    if (existing == null || existing.length < data.length) {
+      _outOfOrder[offset] = data;
+    }
+  }
+
+  void _drainOutOfOrder() {
+    while (true) {
+      final exact = _outOfOrder.remove(_receiveOffset);
+      if (exact != null) {
+        _deliver(exact);
+        _receiveOffset += exact.length;
+        continue;
+      }
+      // A buffered entry may straddle the frontier after other
+      // deliveries advanced it -- deliver its tail.
+      int? straddleKey;
+      Uint8List? straddleData;
+      for (final e in _outOfOrder.entries) {
+        if (e.key < _receiveOffset && e.key + e.value.length > _receiveOffset) {
+          straddleKey = e.key;
+          straddleData = e.value;
+          break;
+        }
+      }
+      if (straddleKey == null || straddleData == null) {
+        // Nothing deliverable: evict stale entries the frontier has
+        // fully covered (e.g. a shorter retransmission buffered next
+        // to a longer one that later drained) so they cannot linger
+        // for the connection's lifetime.
+        _outOfOrder.removeWhere(
+            (k, v) => k < _receiveOffset && k + v.length <= _receiveOffset);
+        return;
+      }
+      _outOfOrder.remove(straddleKey);
+      final tail =
+          Uint8List.sublistView(straddleData, _receiveOffset - straddleKey);
+      _deliver(tail);
+      _receiveOffset += tail.length;
+    }
+  }
+}
+
 /// A single client-initiated bidirectional stream -- DESIGN.md's entire
 /// stream model. Always stream ID 0 (the first client-initiated
 /// bidirectional stream ID per RFC 9000 §2.1's numbering scheme).
@@ -77,8 +162,8 @@ class QuicStream {
   final StreamController<Uint8List> _incomingController =
       StreamController<Uint8List>.broadcast();
   int _sendOffset = 0;
-  int _receiveOffset = 0;
-  final Map<int, Uint8List> _outOfOrderReceived = {};
+  late final StreamReassembler _reassembler =
+      StreamReassembler(_incomingController.add);
 
   QuicStream._(this._connection);
 
@@ -113,23 +198,7 @@ class QuicStream {
   }
 
   void _handleFrame(StreamFrame frame) {
-    if (frame.offset == _receiveOffset) {
-      _incomingController.add(frame.data);
-      _receiveOffset += frame.data.length;
-      _drainOutOfOrder();
-    } else if (frame.offset > _receiveOffset) {
-      _outOfOrderReceived[frame.offset] = frame.data;
-    }
-    // frame.offset < _receiveOffset: fully-duplicate retransmission,
-    // already delivered -- ignore.
-  }
-
-  void _drainOutOfOrder() {
-    while (_outOfOrderReceived.containsKey(_receiveOffset)) {
-      final data = _outOfOrderReceived.remove(_receiveOffset)!;
-      _incomingController.add(data);
-      _receiveOffset += data.length;
-    }
+    _reassembler.add(frame.offset, frame.data);
   }
 
   Future<void> close() async {
@@ -206,6 +275,13 @@ class Connection {
   final List<Frame> _pendingFlowControlFrames = [];
 
   ConnectionState state = ConnectionState.connecting;
+
+  /// RFC 9001 §8.2: the Source Connection ID of the server's first
+  /// Initial packet, captured at receive time so
+  /// [_validateServerInitialSourceConnectionId] can compare it against
+  /// the initial_source_connection_id the server later declares in its
+  /// transport parameters.
+  Uint8List? _serverFirstInitialScid;
   QuicStream? _stream;
   Timer? _pingTimer;
   Timer? _lossDetectionTimer;
@@ -332,6 +408,8 @@ class Connection {
     final completer = Completer<void>();
     final sub = _handshakeCompleteController.stream.listen((_) {
       if (!completer.isCompleted) completer.complete();
+    }, onError: (Object e, StackTrace st) {
+      if (!completer.isCompleted) completer.completeError(e, st);
     });
     try {
       await completer.future.timeout(handshakeTimeout);
@@ -396,11 +474,12 @@ class Connection {
   KeyEra _oneRttSendEra() => _oneRttSpace.keys.client!.latest;
 
   Future<void> _handleDatagram(Uint8List datagram) async {
-    // RFC 9000 §10.1: receipt of *any* packet from the peer resets the
-    // idle timeout, not just ack-eliciting ones -- a datagram merely
-    // needs to arrive to prove the path is still alive.
-    _lastPacketReceivedAt = DateTime.now();
-    if (state != ConnectionState.closed) _startIdleTimeoutTimer();
+    // NOTE: the idle timer is deliberately NOT reset here, at datagram
+    // arrival -- only once a packet actually decrypts/authenticates
+    // (see the two handlers below). RFC 9000 §10.1: "An endpoint
+    // restarts its idle timer ... when a packet it receives is
+    // successfully processed"; resetting on undecryptable garbage let
+    // any spoofed datagram keep a dead connection alive indefinitely.
     var offset = 0;
     while (offset < datagram.length) {
       final firstByte = datagram[offset];
@@ -435,6 +514,14 @@ class Connection {
       _destinationConnectionId = peek.header.sourceConnectionId;
       _destinationConnectionIdConfirmed = true;
     }
+    // RFC 9001 §8.2 prerequisite: remember the Source Connection ID of
+    // the server's FIRST Initial packet, for later comparison against
+    // the initial_source_connection_id in its transport parameters.
+    if (_serverFirstInitialScid == null &&
+        peek.header.type == LongPacketType.initial &&
+        peek.header.sourceConnectionId.isNotEmpty) {
+      _serverFirstInitialScid = peek.header.sourceConnectionId;
+    }
     final space = switch (peek.header.type) {
       LongPacketType.initial => _initialSpace,
       LongPacketType.handshake => _handshakeSpace,
@@ -465,6 +552,7 @@ class Connection {
                 ? space.largestReceivedPacketNumber!
                 : parsed.packetNumber);
     space.received.onReceived(parsed.packetNumber);
+    _noteAuthenticatedPacketReceived();
 
     await _processFrames(
       parsed.frames,
@@ -507,6 +595,7 @@ class Connection {
                 ? _oneRttSpace.largestReceivedPacketNumber!
                 : parsed.packetNumber);
     _oneRttSpace.received.onReceived(parsed.packetNumber);
+    _noteAuthenticatedPacketReceived();
 
     await _processFrames(
       parsed.frames,
@@ -514,6 +603,15 @@ class Connection {
       space: _oneRttSpace,
     );
     await _maybeSendShortHeaderAck();
+  }
+
+  /// RFC 9000 §10.1: the idle timer restarts only for packets that
+  /// were successfully processed (decrypted + authenticated) -- called
+  /// from both packet handlers at their decrypt-success points, never
+  /// at raw datagram arrival (see _handleDatagram's note).
+  void _noteAuthenticatedPacketReceived() {
+    _lastPacketReceivedAt = DateTime.now();
+    if (state != ConnectionState.closed) _startIdleTimeoutTimer();
   }
 
   /// RFC 9000 §13.2.1 (roughly): dart_quic acknowledges every
@@ -601,14 +699,28 @@ class Connection {
     required PacketNumberSpace space,
   }) async {
     final acknowledgedPns = <int>[];
+    // The last ACK frame's delay field, decoded from the wire in the
+    // peer's units. RFC 9000 §18.2: ack_delay_exponent applies ONLY to
+    // packets in the application-data (1-RTT) space -- ACK frames sent
+    // in Initial/Handshake packets always use the default exponent 3.
+    final ackDelayShift =
+        level == EncryptionLevel.oneRtt ? _ackDelayExponentShift : 1 << 3;
+    var latestAckDelayMicros = 0;
     for (final frame in frames) {
       if (frame is CryptoFrame) {
         await _handshake.feedCryptoData(level, frame.offset, frame.data);
       } else if (frame is AckFrame) {
         acknowledgedPns.addAll(frame.acknowledgedPacketNumbers());
+        latestAckDelayMicros = frame.ackDelay * ackDelayShift;
       } else if (frame is StreamFrame) {
         _onStreamBytesReceived(frame);
-        _stream?._handleFrame(frame);
+        // Frames for any stream other than our single bidi stream 0
+        // (a server-initiated stream we never opened) must not
+        // corrupt stream 0's reassembly -- drop them for this
+        // scope (DESIGN.md: exactly one stream, ever).
+        if (frame.streamId == QuicStream.clientBidiStreamId0) {
+          _stream?._handleFrame(frame);
+        }
       } else if (frame is MaxDataFrame) {
         _connectionSendAllowance = frame.maximumData - _connectionBytesSent;
       } else if (frame is MaxStreamDataFrame) {
@@ -628,9 +740,9 @@ class Connection {
     if (acknowledgedPns.isNotEmpty) {
       final result = space.lossDetector.onAckReceived(
         acknowledgedPacketNumbers: acknowledgedPns,
-        ackDelay: Duration.zero,
+        ackDelay: Duration(microseconds: latestAckDelayMicros),
         handshakeConfirmed: _handshake.isComplete,
-        maxAckDelay: const Duration(milliseconds: 25),
+        maxAckDelay: _serverMaxAckDelay,
         now: DateTime.now(),
       );
       for (final acked in result.newlyAcked) {
@@ -903,20 +1015,97 @@ class Connection {
     // (how much the REMOTE endpoint allows on streams it didn't
     // initiate) -- RFC 9000 §18.2's table.
     _streamSendAllowance = server.initialMaxStreamDataBidiRemote;
+    // RTT accounting inputs (RFC 9000 §18.2): the peer's ACK delay
+    // scaling and its declared max ACK delay.
+    _ackDelayExponentShift = 1 << server.ackDelayExponent;
+    if (server.maxAckDelay > 0) {
+      _serverMaxAckDelay = Duration(milliseconds: server.maxAckDelay);
+    }
+    _validateServerInitialSourceConnectionId(server);
+  }
+
+  /// An ACK frame's delay field on the wire carries the peer's ACK
+  /// delay in microseconds DIVIDED by 2^ack_delay_exponent (RFC 9000
+  /// §19.3); decoding multiplies it back. Default exponent 3 when the
+  /// server didn't advertise one.
+  int _ackDelayExponentShift = 1 << 3;
+  Duration _serverMaxAckDelay = const Duration(milliseconds: 25);
+
+  /// RFC 9001 §8.2: the client MUST verify that the
+  /// initial_source_connection_id in the server's transport parameters
+  /// equals the Source Connection ID from the first Initial packet it
+  /// received from the server -- this binds the handshake (and thus
+  /// the negotiated keys) to the actual observed peer, defeating
+  /// connection-confusion/reflection attacks. A mismatch is a protocol
+  /// violation and tears the connection down.
+  void _validateServerInitialSourceConnectionId(TransportParameters server) {
+    final expected = _serverFirstInitialScid;
+    final claimed = server.initialSourceConnectionId;
+    // RFC 9000 §7.3: the server MUST send initial_source_connection_id;
+    // its absence is a TRANSPORT_PARAMETER_ERROR. Surfaced through the
+    // handshake-complete stream (not a throw, which the packet
+    // processing chain would swallow) so connect() fails with the
+    // specific cause instead of a generic handshake timeout.
+    if (expected == null) return; // never saw a server Initial packet
+    if (claimed == null) {
+      unawaited(_closeInternal());
+      _handshakeCompleteController.addError(const ConnectionException(
+          'server transport parameters omitted '
+          'initial_source_connection_id (RFC 9000 §7.3)'));
+      return;
+    }
+    if (!_bytesEqual(expected, claimed)) {
+      unawaited(_closeInternal());
+      _handshakeCompleteController.addError(ConnectionException(
+          'server transport parameters initial_source_connection_id '
+          'mismatch: claimed ${claimed.length} bytes, observed '
+          '${expected.length} bytes -- possible connection confusion'));
+    }
+  }
+
+  static bool _bytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
   }
 
   /// Sends as many queued stream chunks as the current flow-control
-  /// allowances and leave queued. Each chunk reuses the stream's
-  /// _sendOffset bookkeeping via _sendStreamChunk, which advances it.
+  /// allowances, congestion window, and leave queued. Each chunk reuses
+  /// the stream's _sendOffset bookkeeping via _sendStreamChunk, which
+  /// advances it. Flushes are re-triggered whenever an ACK grows the
+  /// congestion window or a MAX_DATA frame grows the flow-control
+  /// allowance (both from _processFrames), and by PTO probes if
+  /// everything in flight was lost (probes themselves bypass this gate
+  /// per RFC 9002 §6.2/A.9, so the loop can never wedge).
+  ///
+  /// Single-flight: only one loop may run at a time. canSend() reads
+  /// bytesInFlight synchronously, but the in-flight counter only grows
+  /// after _sendStreamChunk's packet-build await -- without this guard
+  /// two interleaved flush loops both pass the gate and overshoot the
+  /// congestion window (same TOCTOU family as the _sendOffset race).
+  /// Re-entrant calls return immediately; the running loop re-reads
+  /// the gates each iteration, so no wakeup is lost.
+  bool _flushPendingSendsInFlight = false;
   Future<void> _flushPendingSends() async {
-    while (_pendingSends.isNotEmpty) {
-      final next = _pendingSends.first;
-      if (_connectionSendAllowance < next.length ||
-          _streamSendAllowance < next.length) {
-        return; // window exhausted; retry on the next MAX_DATA arrival
+    if (_flushPendingSendsInFlight) return;
+    _flushPendingSendsInFlight = true;
+    try {
+      while (_pendingSends.isNotEmpty) {
+        final next = _pendingSends.first;
+        if (_connectionSendAllowance < next.length ||
+            _streamSendAllowance < next.length) {
+          return; // flow-control window exhausted; retry on MAX_DATA
+        }
+        if (!_congestion.canSend(next.length + 64)) {
+          return; // congestion window exhausted; retry on next ACK/PTO
+        }
+        _pendingSends.removeAt(0);
+        await _sendStreamChunk(next);
       }
-      _pendingSends.removeAt(0);
-      await _sendStreamChunk(next);
+    } finally {
+      _flushPendingSendsInFlight = false;
     }
   }
 
@@ -926,7 +1115,18 @@ class Connection {
       throw const ConnectionException(
           'cannot send stream data before the handshake completes');
     }
+    // Read AND advance all bookkeeping synchronously, before the
+    // packet-build await below: two flush loops (the app's write()
+    // path and _processFrames' flush on an incoming MAX_DATA) can
+    // interleave at that await, and advancing after it let both read
+    // the SAME _sendOffset -- two STREAM frames with identical offsets,
+    // i.e. silent stream-data corruption on the peer.
     final offset = stream._sendOffset;
+    stream._sendOffset = offset + data.length;
+    _connectionBytesSent += data.length;
+    _streamBytesSent += data.length;
+    _connectionSendAllowance -= data.length;
+    _streamSendAllowance -= data.length;
     final frame = StreamFrame(
         streamId: QuicStream.clientBidiStreamId0, offset: offset, data: data);
     final packetNumber = _oneRttSpace.allocatePacketNumber();
@@ -951,12 +1151,6 @@ class Connection {
       retransmittableFrames: [frame],
     ));
     _congestion.onPacketSent(built.bytes.length);
-
-    _connectionBytesSent += data.length;
-    _streamBytesSent += data.length;
-    _connectionSendAllowance -= data.length;
-    _streamSendAllowance -= data.length;
-    stream._sendOffset += data.length;
 
     _sendDatagram(built.bytes);
     _rearmLossDetectionTimer();

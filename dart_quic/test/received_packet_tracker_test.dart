@@ -80,4 +80,45 @@ void main() {
     final t = ReceivedPacketTracker();
     expect(t.buildAckFrame(0), isNull);
   });
+
+  test('huge packet-number jump cannot stall ack building', () {
+    final t = ReceivedPacketTracker();
+    for (var pn = 0; pn <= 5; pn++) {
+      t.onReceived(pn);
+    }
+    // 4-byte truncated packet numbers legally jump to ~2^31. The old
+    // gap walk scanned every pn between frontier and the straggler --
+    // billions of iterations freezing the event loop; now it must
+    // return immediately with an honest single-packet ack.
+    const hugePn = 0x7FFFFFFF;
+    t.onReceived(hugePn);
+    final ack = t.buildAckFrame(0)!;
+    expect(ack.largestAcknowledged, hugePn);
+    expect(ack.firstAckRange, 0); // nothing else near the straggler
+    expect(ack.ackRanges, isEmpty);
+    // The straggler is acked as largestAcknowledged itself; the gap
+    // below is skipped (those pns were never received, so acking only
+    // the top run stays honest).
+    final acked = ack.acknowledgedPacketNumbers().toSet();
+    expect(acked.contains(hugePn), isTrue);
+    for (final pn in acked.where((p) => p != hugePn)) {
+      expect(pn <= 5, isTrue, reason: 'acked pn $pn was never received');
+    }
+  });
+
+  test('straggler tracking is bounded under adversarial injection', () {
+    final t = ReceivedPacketTracker();
+    t.onReceived(0);
+    // Far more stragglers than the cap: state must stay bounded and
+    // building an ack must terminate, never claiming unreceived pns.
+    for (var pn = 10; pn < 10 + kMaxTrackedStragglers * 4; pn += 2) {
+      t.onReceived(pn);
+    }
+    final ack = t.buildAckFrame(0)!;
+    expect(ack.largestAcknowledged, 10 + kMaxTrackedStragglers * 4 - 2);
+    for (final pn in ack.acknowledgedPacketNumbers()) {
+      expect(pn.isEven || pn == 0, isTrue,
+          reason: 'acked pn $pn was never received');
+    }
+  });
 }

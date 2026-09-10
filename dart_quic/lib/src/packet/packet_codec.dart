@@ -107,7 +107,7 @@ Future<PacketBuildResult> buildShortHeaderPacket({
   required Uint8List destinationConnectionId,
   required int packetNumber,
   required int packetNumberLength,
-  required bool keyPhase,
+  required int keyPhase,
   required DirectionalKeys keys,
   required List<Frame> frames,
 }) async {
@@ -156,10 +156,17 @@ class ParsedPacket {
   final int packetNumber;
   final List<Frame> frames;
   final int totalBytesConsumed;
+
+  /// The Key Phase bit this packet was protected with (RFC 9001 §6) --
+  /// only meaningful for short-header (1-RTT) packets; long-header
+  /// callers get 0. Lets the connection layer notice the peer rotated
+  /// keys and follow with its own send-key update.
+  final int keyPhase;
   const ParsedPacket({
     required this.packetNumber,
     required this.frames,
     required this.totalBytesConsumed,
+    this.keyPhase = 0,
   });
 }
 
@@ -239,29 +246,41 @@ Future<ParsedPacket> openLongHeaderPacket({
 /// occupying the rest of [datagram] starting at [offset] (short-header
 /// packets extend to the end of the datagram -- RFC 9000 §12.2) and
 /// decodes its frames.
+///
+/// Key Update (RFC 9001 §6.1): "The header protection key is not
+/// updated" -- every era in [keyRing] shares one fixed hp key, so
+/// header protection is removed exactly once (unlike packet
+/// protection, which genuinely differs per era). Only the resulting
+/// Key Phase bit is ambiguous between "current era" and "the next era,
+/// which the peer has already rotated to" (RFC 9001 §6.5), so the AEAD
+/// open is attempted against whichever retained era(s) carry that
+/// phase, newest first, then a trial `quic ku` derivation of the next
+/// era if none of the retained ones match or authenticate -- rolled
+/// back unless it authenticates.
 Future<ParsedPacket> openShortHeaderPacket({
   required Uint8List datagram,
   required int offset,
   required int destinationConnectionIdLength,
-  required DirectionalKeys keys,
+  required DirectionalKeyRing keyRing,
   required int? largestReceivedPn,
 }) async {
   final packetBytes = Uint8List.fromList(datagram.sublist(offset));
-
   final decoded = ShortHeader.decodeUpToPacketNumber(
     packetBytes,
     0,
     destinationConnectionIdLength: destinationConnectionIdLength,
   );
 
+  final hpKey = keyRing.eras.first.keys.hp;
   final removal = removeHeaderProtectionFirstByte(
     packet: packetBytes,
-    hpKey: keys.hp,
+    hpKey: hpKey,
     packetNumberOffset: decoded.packetNumberOffset,
     form: HeaderForm.short,
   );
   packetBytes[0] = removal.unmaskedFirstByte;
   final pnLength = (removal.unmaskedFirstByte & 0x03) + 1;
+  final keyPhase = (removal.unmaskedFirstByte >> 2) & 1;
   unmaskPacketNumber(
     packet: packetBytes,
     mask: removal.mask,
@@ -270,9 +289,9 @@ Future<ParsedPacket> openShortHeaderPacket({
   );
 
   var truncatedPn = 0;
-  for (var i = 0; i < pnLength; i++) {
+  for (var p = 0; p < pnLength; p++) {
     truncatedPn =
-        (truncatedPn << 8) | packetBytes[decoded.packetNumberOffset + i];
+        (truncatedPn << 8) | packetBytes[decoded.packetNumberOffset + p];
   }
   final fullPn = largestReceivedPn == null
       ? truncatedPn
@@ -287,18 +306,47 @@ Future<ParsedPacket> openShortHeaderPacket({
   final protectedPayload =
       Uint8List.sublistView(packetBytes, decoded.packetNumberOffset + pnLength);
 
-  final plaintext = await aeadAes128GcmOpen(
-    key: keys.key,
-    iv: keys.iv,
-    packetNumber: fullPn,
-    header: headerBytes,
-    protectedPayload: protectedPayload,
-  );
+  PacketProtectionException? lastFailure;
 
-  final frames = decodeAllFrames(plaintext);
-  return ParsedPacket(
-    packetNumber: fullPn,
-    frames: frames,
-    totalBytesConsumed: packetBytes.length,
-  );
+  // Retained eras whose Key Phase matches the decoded bit, newest
+  // first (a reordered straggler from a still-retained older era with
+  // the same phase parity -- e.g. era 0 and era 2 both carry phase
+  // 0 -- must still decrypt), then a trial next-era derivation if the
+  // decoded phase doesn't match anything retained yet.
+  final candidates =
+      keyRing.eras.reversed.where((e) => e.keyPhase == keyPhase).toList();
+  var trialAdvanced = false;
+  if (candidates.isEmpty) {
+    candidates.add(await keyRing.advance());
+    trialAdvanced = true;
+  }
+
+  for (final era in candidates) {
+    try {
+      final plaintext = await aeadAes128GcmOpen(
+        key: era.keys.key,
+        iv: era.keys.iv,
+        packetNumber: fullPn,
+        header: headerBytes,
+        protectedPayload: protectedPayload,
+      );
+      final frames = decodeAllFrames(plaintext);
+      return ParsedPacket(
+        packetNumber: fullPn,
+        frames: frames,
+        totalBytesConsumed: packetBytes.length,
+        keyPhase: keyPhase,
+      );
+    } on PacketProtectionException catch (e) {
+      lastFailure = PacketProtectionException(
+          'AEAD open failed (era=${era.keyPhase}): fullPn=$fullPn '
+          'truncatedPn=$truncatedPn pnLength=$pnLength '
+          'payloadLen=${protectedPayload.length}: ${e.message}');
+    }
+  }
+
+  if (trialAdvanced) {
+    keyRing.rollbackLast();
+  }
+  throw lastFailure ?? const PacketProtectionException('no key eras available');
 }

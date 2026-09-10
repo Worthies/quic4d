@@ -8,25 +8,45 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
 // Minimal quic-go server mirroring leaf's server/quic_visitor.go ALPN +
-// mTLS config, for dart_quic's integration test. Reads newline-
-// delimited lines (matching commander's wire framing) from the
-// client's first bidi stream in a loop, echoing each back with a
-// prefix, until the stream is closed by the peer or an optional
-// message-count limit (3rd CLI arg, default: unlimited until EOF) is
-// reached, then exits.
+// mTLS config, for dart_quic's and commander's integration tests. Reads
+// newline-delimited lines (matching commander's wire framing) from the
+// client's first bidi stream in a loop, echoing each back, until the
+// stream is closed by the peer or an optional message-count limit (3rd
+// CLI arg, -1/absent = unlimited until EOF) is reached, then exits.
+//
+// Echo behavior per line:
+//   - a line that is valid JSON ('{'...'}') is echoed back VERBATIM, so a
+//     client exercising a real commander-style JSON message loop sees the
+//     same shapes it would from leaf's server model layer;
+//   - any other line gets the "echo:" prefix (dart_quic's own interop
+//     tests assert on that prefix).
+//
+// Optional 4th CLI arg "-welcome": right after accepting the stream,
+// write a leaf-style welcome line first ({"type":"welcome",...}), the
+// way server/quic_visitor.go's accept path does -- needed by
+// commander's QuicClient e2e test, which keys its connected/visitorName
+// state off that message. dart_quic's own tests do not pass this flag
+// (they assert the FIRST received chunk is their echo).
 func main() {
 	certDir := os.Args[1]
 	addr := os.Args[2]
 	maxMessages := -1 // unlimited -- read until the client closes the stream
-	if len(os.Args) > 3 {
+	if len(os.Args) > 3 && os.Args[3] != "-welcome" {
 		if n, err := fmt.Sscanf(os.Args[3], "%d", &maxMessages); err != nil || n != 1 {
 			log.Fatalf("invalid max-messages argument: %v", os.Args[3])
+		}
+	}
+	sendWelcome := false
+	for _, arg := range os.Args[3:] {
+		if arg == "-welcome" {
+			sendWelcome = true
 		}
 	}
 
@@ -74,6 +94,14 @@ func main() {
 		log.Fatalf("accept stream: %v", err)
 	}
 
+	if sendWelcome {
+		welcome := `{"type":"welcome","visitor_name":"e2e-test-user","visitors":[]}` + "\n"
+		if _, err := stream.Write([]byte(welcome)); err != nil {
+			log.Fatalf("write welcome: %v", err)
+		}
+		log.Printf("sent welcome")
+	}
+
 	reader := bufio.NewReader(stream)
 	count := 0
 	for maxMessages < 0 || count < maxMessages {
@@ -85,7 +113,13 @@ func main() {
 		log.Printf("received: %q", line)
 		count++
 
-		reply := "echo:" + line
+		trimmed := strings.TrimSpace(line)
+		var reply string
+		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+			reply = line // valid-JSON-looking line: echo verbatim
+		} else {
+			reply = "echo:" + line
+		}
 		if _, err := stream.Write([]byte(reply)); err != nil {
 			log.Fatalf("write: %v", err)
 		}

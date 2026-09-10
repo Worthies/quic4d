@@ -145,11 +145,12 @@ void main() {
 
   group('Short header packet round trip', () {
     test('build + open recovers the exact frames sent', () async {
-      // Use Initial-derived keys as a stand-in DirectionalKeys source
-      // for this structural round-trip test -- 1-RTT keys would come
-      // from key_schedule.dart in a real connection, but the codec
-      // logic being tested here (header assembly + AEAD + header
-      // protection) doesn't care which traffic secret produced them.
+      // Use Initial-derived keys as a stand-in key source for this
+      // structural round-trip test -- 1-RTT keys would come from
+      // key_schedule.dart in a real connection, but the codec logic
+      // being tested here (header assembly + AEAD + header protection)
+      // doesn't care which traffic secret produced them. The ring wraps
+      // era 0 around them the way PacketNumberSpace.installKeys does.
       final dcid =
           Uint8List.fromList([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
       final secrets = await deriveInitialSecrets(dcid);
@@ -157,6 +158,8 @@ void main() {
           key: secrets.client.key,
           iv: secrets.client.iv,
           hp: secrets.client.hp);
+      final ring = DirectionalKeyRing(Uint8List(0));
+      await ring.installInitial(keys.key, keys.iv, keys.hp);
 
       final streamFrame = StreamFrame(
         streamId: 4,
@@ -169,7 +172,7 @@ void main() {
         destinationConnectionId: dcid,
         packetNumber: 10,
         packetNumberLength: 2,
-        keyPhase: false,
+        keyPhase: 0,
         keys: keys,
         frames: [streamFrame],
       );
@@ -178,13 +181,65 @@ void main() {
         datagram: built.bytes,
         offset: 0,
         destinationConnectionIdLength: dcid.length,
-        keys: keys,
+        keyRing: ring,
         largestReceivedPn: null,
       );
 
       expect(opened.packetNumber, 10);
+      expect(opened.keyPhase, 0);
       expect(opened.frames.single, isA<StreamFrame>());
       expect((opened.frames.single as StreamFrame).data, streamFrame.data);
+    });
+
+    test('key-update era advance + rollback round trip (RFC 9001 SS6)',
+        () async {
+      final dcid =
+          Uint8List.fromList([0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08]);
+      final secrets = await deriveInitialSecrets(dcid);
+      final keys = DirectionalKeys(
+          key: secrets.client.key,
+          iv: secrets.client.iv,
+          hp: secrets.client.hp);
+      final ring = DirectionalKeyRing(Uint8List(0));
+      await ring.installInitial(keys.key, keys.iv, keys.hp);
+
+      // Advance to era 1 (flipped key phase) and build a packet with it.
+      final era1 = await ring.advance();
+      expect(era1.keyPhase, 1);
+      expect(ring.eras.length, 2);
+
+      final built = await buildShortHeaderPacket(
+        destinationConnectionId: dcid,
+        packetNumber: 20,
+        packetNumberLength: 2,
+        keyPhase: era1.keyPhase,
+        keys: era1.keys,
+        frames: const [PingFrame()],
+      );
+
+      // Receiver holding only era 0 sees keyPhase=1, trial-derives era
+      // 1, and must decrypt successfully (the "quic ku" chain is
+      // deterministic from the same initial secret).
+      final opened = await openShortHeaderPacket(
+        datagram: built.bytes,
+        offset: 0,
+        destinationConnectionIdLength: dcid.length,
+        keyRing: ring,
+        largestReceivedPn: 19,
+      );
+      expect(opened.packetNumber, 20);
+      expect(opened.keyPhase, 1);
+      expect(opened.frames.whereType<PingFrame>(), isNotEmpty);
+
+      // Rollback returns to a single-era ring whose next advance
+      // re-derives the same era-1 keys (chain root restored).
+      ring.rollbackLast();
+      expect(ring.eras.length, 1);
+      final era1Again = await ring.advance();
+      expect(era1Again.keyPhase, 1);
+      expect(era1Again.keys.key, era1.keys.key);
+      expect(era1Again.keys.iv, era1.keys.iv);
+      expect(era1Again.keys.hp, era1.keys.hp);
     });
   });
 }

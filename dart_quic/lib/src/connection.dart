@@ -24,6 +24,7 @@ import 'packet/header.dart';
 import 'packet/initial_secrets.dart';
 import 'packet/packet_codec.dart';
 import 'packet/packet_number_space.dart';
+import 'packet/protection.dart' show PacketProtectionException;
 import 'recovery/congestion_control.dart';
 import 'recovery/loss_detection.dart' show LostPacket;
 import 'recovery/rtt_estimator.dart';
@@ -239,15 +240,17 @@ class Connection {
 
     final initialSecrets =
         await deriveInitialSecrets(_initialDestinationConnectionId);
-    _initialSpace.keys.client = DirectionalKeys(
-      key: initialSecrets.client.key,
-      iv: initialSecrets.client.iv,
-      hp: initialSecrets.client.hp,
+    _initialSpace.keys.client = DirectionalKeyRing(Uint8List(0));
+    await _initialSpace.keys.client!.installInitial(
+      initialSecrets.client.key,
+      initialSecrets.client.iv,
+      initialSecrets.client.hp,
     );
-    _initialSpace.keys.server = DirectionalKeys(
-      key: initialSecrets.server.key,
-      iv: initialSecrets.server.iv,
-      hp: initialSecrets.server.hp,
+    _initialSpace.keys.server = DirectionalKeyRing(Uint8List(0));
+    await _initialSpace.keys.server!.installInitial(
+      initialSecrets.server.key,
+      initialSecrets.server.iv,
+      initialSecrets.server.hp,
     );
 
     _handshake.start();
@@ -296,9 +299,29 @@ class Connection {
     Datagram? datagram;
     while ((datagram = _socket!.receive()) != null) {
       final data = datagram!.data;
-      _processingChain = _processingChain.then((_) => _handleDatagram(data));
+      // RFC 9000 SS12.2: a packet whose protection can't be removed MUST
+      // be discarded while the rest of the datagram is still attempted --
+      // and a single bad packet must never poison this chain, since every
+      // later datagram is chained behind it. Without this catchError an
+      // AEAD failure on any packet permanently stopped ALL inbound
+      // processing (observed live as "connects, welcome arrives, then no
+      // messages ever again" against a real quic-go server).
+      _processingChain =
+          _processingChain.then((_) => _handleDatagram(data)).catchError(
+        (Object e, StackTrace st) {
+          // Diagnostics only, RFC 9000 §12.2 discard-and-continue applies
+          // regardless: swallow it rather than letting it escape to the
+          // socket-event handler.
+        },
+      );
     }
   }
+
+  /// The key era outgoing 1-RTT packets are protected with -- always
+  /// the client ring's latest, whose keyPhase the short-header first
+  /// byte carries (updated by _handleShortHeaderPacketAt when the peer
+  /// rotates, per RFC 9001 §6.1).
+  KeyEra _oneRttSendEra() => _oneRttSpace.keys.client!.latest;
 
   Future<void> _handleDatagram(Uint8List datagram) async {
     // RFC 9000 §10.1: receipt of *any* packet from the peer resets the
@@ -313,7 +336,13 @@ class Connection {
       if (isLongHeader) {
         offset = await _handleLongHeaderPacketAt(datagram, offset);
       } else {
-        await _handleShortHeaderPacketAt(datagram, offset);
+        try {
+          await _handleShortHeaderPacketAt(datagram, offset);
+        } on PacketProtectionException {
+          // RFC 9000 §12.2: a packet that can't be authenticated is
+          // discarded silently; processing continues with whatever
+          // else is in flight rather than treating this as fatal.
+        }
         offset = datagram.length; // short header always consumes the rest
       }
       if (offset < 0) break;
@@ -354,7 +383,7 @@ class Connection {
     final parsed = await openLongHeaderPacket(
       datagram: datagram,
       offset: offset,
-      keys: space.keys.server!,
+      keys: space.keys.serverLatest!,
       largestReceivedPn: space.largestReceivedPacketNumber,
     );
     space.largestReceivedPacketNumber =
@@ -380,13 +409,24 @@ class Connection {
   Future<void> _handleShortHeaderPacketAt(
       Uint8List datagram, int offset) async {
     if (!_oneRttSpace.keys.hasKeys) return; // 1-RTT keys not ready yet
+    final serverRing = _oneRttSpace.keys.server!;
+    final eraCountBeforeOpen = serverRing.eras.length;
     final parsed = await openShortHeaderPacket(
       datagram: datagram,
       offset: offset,
       destinationConnectionIdLength: _sourceConnectionId.length,
-      keys: _oneRttSpace.keys.server!,
+      keyRing: serverRing,
       largestReceivedPn: _oneRttSpace.largestReceivedPacketNumber,
     );
+    // RFC 9001 §6.1: the trial next-era derivation inside
+    // openShortHeaderPacket authenticated, so the peer genuinely
+    // rotated its keys -- the server ring just grew. Follow by rotating
+    // OUR send keys too, so both directions stay in adjacent eras and
+    // the peer's own receive path sees the same key-update handshake
+    // (quic-go accepts either era on receive, same as we now do).
+    if (serverRing.eras.length > eraCountBeforeOpen) {
+      await _oneRttSpace.keys.client!.advance();
+    }
     _oneRttSpace.largestReceivedPacketNumber =
         _oneRttSpace.largestReceivedPacketNumber == null
             ? parsed.packetNumber
@@ -441,7 +481,7 @@ class Connection {
       token: Uint8List(0),
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keys: space.keys.client!,
+      keys: space.keys.clientLatest!,
       frames: [ackFrame],
     );
     space.lossDetector.onPacketSent(SentPacket(
@@ -472,8 +512,8 @@ class Connection {
       destinationConnectionId: _destinationConnectionId,
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keyPhase: false,
-      keys: _oneRttSpace.keys.client!,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
       frames: [ackFrame],
     );
     _oneRttSpace.lossDetector.onPacketSent(SentPacket(
@@ -589,7 +629,7 @@ class Connection {
       token: Uint8List(0),
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keys: space.keys.client!,
+      keys: space.keys.clientLatest!,
       frames: [frame],
     );
     space.lossDetector.onPacketSent(SentPacket(
@@ -616,8 +656,8 @@ class Connection {
       destinationConnectionId: _destinationConnectionId,
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keyPhase: false,
-      keys: _oneRttSpace.keys.client!,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
       frames: [frame],
     );
     _oneRttSpace.lossDetector.onPacketSent(SentPacket(
@@ -699,7 +739,7 @@ class Connection {
       token: Uint8List(0),
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keys: space.keys.client!,
+      keys: space.keys.clientLatest!,
       frames: [frame],
     );
 
@@ -755,8 +795,8 @@ class Connection {
       destinationConnectionId: _destinationConnectionId,
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keyPhase: false,
-      keys: _oneRttSpace.keys.client!,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
       frames: [frame],
     );
 
@@ -814,8 +854,8 @@ class Connection {
       destinationConnectionId: _destinationConnectionId,
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keyPhase: false,
-      keys: _oneRttSpace.keys.client!,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
       frames: const [PingFrame()],
     );
     _oneRttSpace.lossDetector.onPacketSent(SentPacket(
@@ -980,7 +1020,7 @@ class Connection {
       token: Uint8List(0),
       packetNumber: packetNumber,
       packetNumberLength: pnLength,
-      keys: space.keys.client!,
+      keys: space.keys.clientLatest!,
       frames: const [PingFrame()],
     );
     space.lossDetector.onPacketSent(SentPacket(

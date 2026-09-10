@@ -288,7 +288,7 @@ class LongHeader {
 class ShortHeader {
   final bool spinBit;
   final int reservedBits;
-  final bool keyPhase;
+  final int keyPhase;
   final int packetNumberLength;
   final Uint8List destinationConnectionId;
   final int packetNumber;
@@ -308,7 +308,7 @@ class ShortHeader {
     final firstByte = 0x40 | // fixed bit
         (spinBit ? 0x20 : 0) |
         (reservedBits << 3) |
-        (keyPhase ? 0x04 : 0) |
+        (keyPhase != 0 ? 0x04 : 0) |
         (pnLen - 1);
     sink.addByte(firstByte);
     sink.add(destinationConnectionId);
@@ -354,7 +354,7 @@ class ShortHeader {
       header: ShortHeader(
         spinBit: (firstByte & 0x20) != 0,
         reservedBits: (firstByte >> 3) & 0x03, // still masked
-        keyPhase: (firstByte & 0x04) != 0, // still masked
+        keyPhase: (firstByte & 0x04) != 0 ? 1 : 0, // still masked
         packetNumberLength: (firstByte & 0x03) + 1, // still masked
         destinationConnectionId: dcid,
       ),

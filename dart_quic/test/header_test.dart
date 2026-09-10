@@ -134,7 +134,7 @@ void main() {
       final header = ShortHeader(
         spinBit: true,
         reservedBits: 0,
-        keyPhase: true,
+        keyPhase: 1,
         packetNumberLength: 2,
         destinationConnectionId: dcid,
         packetNumber: 999,
@@ -147,7 +147,7 @@ void main() {
         destinationConnectionIdLength: dcid.length,
       );
       expect(decoded.header.spinBit, isTrue);
-      expect(decoded.header.keyPhase, isTrue);
+      expect(decoded.header.keyPhase, 1);
       expect(decoded.header.packetNumberLength, 2);
       expect(decoded.header.destinationConnectionId, dcid);
       expect(decoded.packetNumberOffset, result.packetNumberOffset);

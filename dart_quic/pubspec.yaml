@@ -1,0 +1,19 @@
+name: dart_quic
+description: >
+  Pure-Dart QUIC v1 (RFC 9000/9001) client, scoped to what leaf's commander
+  needs: a single client-initiated bidirectional stream, mTLS client-cert
+  auth, and interop with a quic-go server. No FFI, no Rust toolchain.
+version: 0.1.0
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  cryptography: ^2.9.0
+  pointycastle: ^4.0.0
+  basic_utils: ^5.8.2
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^5.0.0

@@ -93,11 +93,12 @@ class QuicStream {
   /// multiple STREAM frames/packets of at most
   /// [kMaxStreamFrameChunkSize] bytes each -- see that constant's doc
   /// for why a single write() call used to silently fail for anything
-  /// much bigger than a short chat message. Each chunk still carries
-  /// its own correct offset, so the receiver's existing offset-based
-  /// reassembly ([_handleFrame]/[_drainOutOfOrder]) needs no changes:
-  /// chunks arrive (and are delivered to [incoming]) in the same order
-  /// they were sent, one `incoming` event per chunk.
+  /// much bigger than a short chat message. Each chunk carries its own
+  /// correct offset ([_sendOffset] is advanced by the connection layer
+  /// as each chunk is actually transmitted, honoring send-side flow
+  /// control -- chunks may queue until the peer opens its window), so
+  /// the receiver's existing offset-based reassembly
+  /// ([_handleFrame]/[_drainOutOfOrder]) needs no changes.
   Future<void> write(Uint8List data) async {
     if (data.isEmpty) return;
     var pos = 0;
@@ -106,12 +107,7 @@ class QuicStream {
           ? pos + kMaxStreamFrameChunkSize
           : data.length;
       final chunk = Uint8List.sublistView(data, pos, end);
-      await _connection._sendStreamData(
-        streamId: clientBidiStreamId0,
-        offset: _sendOffset,
-        data: chunk,
-      );
-      _sendOffset += chunk.length;
+      await _connection._sendStreamData(chunk);
       pos = end;
     }
   }
@@ -171,6 +167,43 @@ class Connection {
   late final PacketNumberSpace _handshakeSpace;
   late final PacketNumberSpace _oneRttSpace;
   final CongestionController _congestion = CongestionController();
+
+  // ---- Receive-side flow control (RFC 9000 §4) ----
+  // The limits we advertised in our transport parameters. Once the
+  // peer has sent half the current limit, [_onStreamBytesReceived]
+  // raises it and queues MAX_DATA/MAX_STREAM_DATA frames onto the next
+  // ACK. Without these updates the peer is flow-control BLOCKED
+  // forever once it has sent the initial 10 MiB -- observed live as
+  // "connection goes silent, commander's 45s watchdog reconnects",
+  // with every reconnect's history sync burning through the fresh
+  // window faster and disconnects getting more frequent.
+  int _connectionReceiveLimit = 10 * 1024 * 1024;
+  int _connectionBytesReceived = 0;
+  int _streamReceiveLimit = 10 * 1024 * 1024;
+  int _maxStreamEndOffset = 0;
+
+  // ---- Send-side flow control (RFC 9000 §4) ----
+  // How much this endpoint may still send, per the peer's advertised
+  // initial limits (parsed from the server's transport parameters --
+  // previously never parsed at all, so sends beyond the server's
+  // initial window worked only by luck of the server's reader keeping
+  // up) plus any MAX_DATA/MAX_STREAM_DATA updates it sends while the
+  // connection is live. Writes beyond the allowance queue in
+  // [_pendingSends] until the peer opens the window.
+  int _connectionSendAllowance = 0;
+  int _streamSendAllowance = 0;
+  final List<Uint8List> _pendingSends = [];
+
+  /// Total stream payload bytes this endpoint has SENT (1-RTT), for
+  /// converting the peer's absolute MAX_DATA/MAX_STREAM_DATA offsets
+  /// into remaining allowances.
+  int _connectionBytesSent = 0;
+  int _streamBytesSent = 0;
+
+  /// Window-update frames queued for the next outbound packet, set by
+  /// [_onStreamBytesReceived] and consumed by
+  /// [_takePendingFlowControlFrames].
+  final List<Frame> _pendingFlowControlFrames = [];
 
   ConnectionState state = ConnectionState.connecting;
   QuicStream? _stream;
@@ -431,6 +464,7 @@ class Connection {
             : (space.largestReceivedPacketNumber! > parsed.packetNumber
                 ? space.largestReceivedPacketNumber!
                 : parsed.packetNumber);
+    space.received.onReceived(parsed.packetNumber);
 
     await _processFrames(
       parsed.frames,
@@ -472,6 +506,7 @@ class Connection {
             : (_oneRttSpace.largestReceivedPacketNumber! > parsed.packetNumber
                 ? _oneRttSpace.largestReceivedPacketNumber!
                 : parsed.packetNumber);
+    _oneRttSpace.received.onReceived(parsed.packetNumber);
 
     await _processFrames(
       parsed.frames,
@@ -492,23 +527,13 @@ class Connection {
   /// server; see test/integration/quic_go_interop_test.dart).
   Future<void> _maybeSendAck(PacketNumberSpace space,
       {required LongPacketType type}) async {
-    final largest = space.largestReceivedPacketNumber;
-    if (largest == null) return;
-    // firstAckRange=0: acknowledges only the single largest-numbered
-    // packet, not a claimed contiguous range down from it -- this
-    // library doesn't track every individual received packet number
-    // (see DESIGN.md's simplified-loss-recovery scope), so claiming a
-    // wider contiguous range risks falsely acknowledging a packet that
-    // was actually lost/reordered. During the handshake specifically,
-    // quic-go only needs *an* ACK to release anti-amplification
-    // budget/stop retransmitting -- it doesn't require every packet
-    // number be individually acked -- so this minimal-but-honest range
-    // is sufficient.
-    final ackFrame = AckFrame(
-      largestAcknowledged: largest,
-      ackDelay: 0,
-      firstAckRange: 0,
-    );
+    // Honest multi-range ACK from the received-packet tracker: every
+    // packet actually received so far is acknowledged, not just the
+    // single largest -- see ReceivedPacketTracker's doc for the
+    // retransmission-amplification bug the old largest-only ACK
+    // caused against a real quic-go server.
+    final ackFrame = space.received.buildAckFrame(0);
+    if (ackFrame == null) return;
     final packetNumber = space.allocatePacketNumber();
     final pnLength =
         packetNumberEncodingLength(packetNumber, space.largestAckedPacket);
@@ -537,13 +562,15 @@ class Connection {
   }
 
   Future<void> _maybeSendShortHeaderAck() async {
-    final largest = _oneRttSpace.largestReceivedPacketNumber;
-    if (largest == null || !_oneRttSpace.keys.hasKeys) return;
-    final ackFrame = AckFrame(
-      largestAcknowledged: largest,
-      ackDelay: 0,
-      firstAckRange: 0,
-    );
+    if (!_oneRttSpace.keys.hasKeys) return;
+    final ackFrame = _oneRttSpace.received.buildAckFrame(0);
+    if (ackFrame == null) return;
+    // Piggyback pending flow-control window updates (MAX_DATA /
+    // MAX_STREAM_DATA) onto this ACK rather than sending them as their
+    // own packets -- window updates are needed exactly when data is
+    // arriving, which is exactly when an ACK is being sent anyway.
+    final frames = <Frame>[ackFrame];
+    frames.addAll(_takePendingFlowControlFrames());
     final packetNumber = _oneRttSpace.allocatePacketNumber();
     final pnLength = packetNumberEncodingLength(
         packetNumber, _oneRttSpace.largestAckedPacket);
@@ -553,12 +580,15 @@ class Connection {
       packetNumberLength: pnLength,
       keyPhase: _oneRttSendEra().keyPhase,
       keys: _oneRttSendEra().keys,
-      frames: [ackFrame],
+      frames: frames,
     );
     _oneRttSpace.lossDetector.onPacketSent(SentPacket(
       packetNumber: packetNumber,
-      ackEliciting: false,
-      inFlight: false,
+      // Only pure ACK/PADDING packets are non-ack-eliciting (RFC 9000
+      // §13.2); a piggybacked MAX_DATA/MAX_STREAM_DATA makes this
+      // packet ack-eliciting and in-flight.
+      ackEliciting: frames.any((f) => f is! AckFrame),
+      inFlight: frames.any((f) => f is! AckFrame),
       sentBytes: built.bytes.length,
       timeSent: DateTime.now(),
     ));
@@ -577,15 +607,22 @@ class Connection {
       } else if (frame is AckFrame) {
         acknowledgedPns.addAll(frame.acknowledgedPacketNumbers());
       } else if (frame is StreamFrame) {
+        _onStreamBytesReceived(frame);
         _stream?._handleFrame(frame);
+      } else if (frame is MaxDataFrame) {
+        _connectionSendAllowance = frame.maximumData - _connectionBytesSent;
+      } else if (frame is MaxStreamDataFrame) {
+        if (frame.streamId == QuicStream.clientBidiStreamId0) {
+          _streamSendAllowance = frame.maximumStreamData - _streamBytesSent;
+        }
       } else if (frame is ConnectionCloseFrame) {
         unawaited(_closeInternal());
         return;
       }
-      // PADDING/PING/HANDSHAKE_DONE and the decode-only frames
-      // (flow_control_frames.dart etc.) need no action per DESIGN.md's
-      // scope -- they're accepted (so decoding never breaks) but not
-      // acted on.
+      // PADDING/PING/HANDSHAKE_DONE and the remaining decode-only
+      // frames (BLOCKED/MAX_STREAMS variants etc.) need no action per
+      // DESIGN.md's scope -- they're accepted (so decoding never
+      // breaks) but not acted on.
     }
 
     if (acknowledgedPns.isNotEmpty) {
@@ -614,8 +651,14 @@ class Connection {
       if (!_oneRttSpace.keys.hasKeys) {
         await _oneRttSpace.installKeys(_handshake.applicationTrafficSecrets);
         _stream = QuicStream._(this);
+        _initSendAllowances();
       }
       _handshakeCompleteController.add(null);
+    }
+    // The peer's MAX_DATA/MAX_STREAM_DATA frames (processed above) may
+    // have just unblocked queued writes.
+    if (_pendingSends.isNotEmpty) {
+      await _flushPendingSends();
     }
     _rearmLossDetectionTimer();
   }
@@ -754,6 +797,7 @@ class Connection {
       // confirmed.
       _handshakeSpace.discard();
       _stream = QuicStream._(this);
+      _initSendAllowances();
     }
   }
 
@@ -816,16 +860,75 @@ class Connection {
     return padded;
   }
 
-  Future<void> _sendStreamData({
-    required int streamId,
-    required int offset,
-    required Uint8List data,
-  }) async {
+  Future<void> _sendStreamData(Uint8List data) async {
     if (!_oneRttSpace.keys.hasKeys) {
       throw const ConnectionException(
           'cannot send stream data before the handshake completes');
     }
-    final frame = StreamFrame(streamId: streamId, offset: offset, data: data);
+    // Send-side flow control (RFC 9000 §4.1): exceeding the peer's
+    // advertised connection/stream offsets is a connection error
+    // (FLOW_CONTROL_ERROR), not something to paper over. Writes that
+    // don't fit the current allowance queue until the peer's
+    // MAX_DATA/MAX_STREAM_DATA opens the window (handled in
+    // _processFrames, which flushes via _flushPendingSends).
+    _pendingSends.add(data);
+    await _flushPendingSends();
+  }
+
+  /// Initial send allowances from the server's transport parameters.
+  /// Called once the handshake completes (the parameters live in the
+  /// server's EncryptedExtensions, parsed by ClientHandshake). Safe to
+  /// call from both completion sites (see _processFrames and
+  /// _flushHandshakeOutbound -- whichever runs first creates the stream
+  /// and the other skips its install block).
+  ///
+  /// A server that omitted the extension entirely (non-conforming, but
+  /// tolerated -- see ClientHandshake._parseEncryptedExtensions) leaves
+  /// the allowances unlimited rather than zero: deadlocking all sends
+  /// forever would be strictly worse than the pre-flow-control
+  /// behavior of trusting the peer's reader to keep up.
+  bool _sendAllowancesInitialized = false;
+  void _initSendAllowances() {
+    if (_sendAllowancesInitialized) return;
+    _sendAllowancesInitialized = true;
+    final server = _handshake.serverTransportParameters;
+    if (server == null) {
+      _connectionSendAllowance = 0x3FFFFFFFFFFFFFFF;
+      _streamSendAllowance = 0x3FFFFFFFFFFFFFFF;
+      return;
+    }
+    _connectionSendAllowance = server.initialMaxData;
+    // For a client-initiated bidi stream, the limit that applies to
+    // OUR sends is the server's initial_max_stream_data_bidi_remote
+    // (how much the REMOTE endpoint allows on streams it didn't
+    // initiate) -- RFC 9000 §18.2's table.
+    _streamSendAllowance = server.initialMaxStreamDataBidiRemote;
+  }
+
+  /// Sends as many queued stream chunks as the current flow-control
+  /// allowances and leave queued. Each chunk reuses the stream's
+  /// _sendOffset bookkeeping via _sendStreamChunk, which advances it.
+  Future<void> _flushPendingSends() async {
+    while (_pendingSends.isNotEmpty) {
+      final next = _pendingSends.first;
+      if (_connectionSendAllowance < next.length ||
+          _streamSendAllowance < next.length) {
+        return; // window exhausted; retry on the next MAX_DATA arrival
+      }
+      _pendingSends.removeAt(0);
+      await _sendStreamChunk(next);
+    }
+  }
+
+  Future<void> _sendStreamChunk(Uint8List data) async {
+    final stream = _stream;
+    if (stream == null) {
+      throw const ConnectionException(
+          'cannot send stream data before the handshake completes');
+    }
+    final offset = stream._sendOffset;
+    final frame = StreamFrame(
+        streamId: QuicStream.clientBidiStreamId0, offset: offset, data: data);
     final packetNumber = _oneRttSpace.allocatePacketNumber();
     final pnLength = packetNumberEncodingLength(
         packetNumber, _oneRttSpace.largestAckedPacket);
@@ -849,8 +952,83 @@ class Connection {
     ));
     _congestion.onPacketSent(built.bytes.length);
 
+    _connectionBytesSent += data.length;
+    _streamBytesSent += data.length;
+    _connectionSendAllowance -= data.length;
+    _streamSendAllowance -= data.length;
+    stream._sendOffset += data.length;
+
     _sendDatagram(built.bytes);
     _rearmLossDetectionTimer();
+  }
+
+  /// Receive-side flow control accounting for one received STREAM
+  /// frame (RFC 9000 §4.2: a receiver MUST NOT let the peer exceed the
+  /// limits it advertised, and SHOULD send MAX_DATA/MAX_STREAM_DATA to
+  /// keep the window open as data is consumed). Policy: when half the
+  /// current limit has been consumed, double it (bounded growth) and
+  /// queue window-update frames for the next outbound packet.
+  void _onStreamBytesReceived(StreamFrame frame) {
+    _connectionBytesReceived += frame.data.length;
+    final end = frame.offset + frame.data.length;
+    if (end > _maxStreamEndOffset) _maxStreamEndOffset = end;
+
+    var updateNeeded = false;
+    if (_connectionBytesReceived >= _connectionReceiveLimit ~/ 2) {
+      _connectionReceiveLimit = _connectionBytesReceived + 10 * 1024 * 1024;
+      _pendingFlowControlFrames
+          .add(MaxDataFrame(maximumData: _connectionReceiveLimit));
+      updateNeeded = true;
+    }
+    if (_maxStreamEndOffset >= _streamReceiveLimit ~/ 2) {
+      _streamReceiveLimit = _maxStreamEndOffset + 10 * 1024 * 1024;
+      _pendingFlowControlFrames.add(MaxStreamDataFrame(
+          streamId: QuicStream.clientBidiStreamId0,
+          maximumStreamData: _streamReceiveLimit));
+      updateNeeded = true;
+    }
+    // A window update with no ACK in flight (the peer is blocked, so
+    // it has stopped sending, so no new ACK is imminent) still needs
+    // to go out -- send a packet now rather than waiting for the next
+    // piggyback opportunity that may never come.
+    if (updateNeeded && _pendingFlowControlFrames.isNotEmpty) {
+      unawaited(_sendFlowControlUpdate());
+    }
+  }
+
+  /// Sends any queued window-update frames as their own packet.
+  Future<void> _sendFlowControlUpdate() async {
+    if (!_oneRttSpace.keys.hasKeys) return;
+    final frames = _takePendingFlowControlFrames();
+    if (frames.isEmpty) return;
+    final packetNumber = _oneRttSpace.allocatePacketNumber();
+    final pnLength = packetNumberEncodingLength(
+        packetNumber, _oneRttSpace.largestAckedPacket);
+    final built = await buildShortHeaderPacket(
+      destinationConnectionId: _destinationConnectionId,
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
+      frames: frames,
+    );
+    _oneRttSpace.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    _sendDatagram(built.bytes);
+    _rearmLossDetectionTimer();
+  }
+
+  List<Frame> _takePendingFlowControlFrames() {
+    if (_pendingFlowControlFrames.isEmpty) return const [];
+    final frames = List<Frame>.from(_pendingFlowControlFrames);
+    _pendingFlowControlFrames.clear();
+    return frames;
   }
 
   void _sendDatagram(Uint8List bytes) {

@@ -176,6 +176,15 @@ class ClientHandshake {
   CertificateRequest? _certificateRequest;
   List<CertificateEntry>? _serverCertificateChain;
 
+  /// The server's QUIC transport parameters, parsed from the
+  /// quic_transport_parameters extension in its EncryptedExtensions
+  /// (RFC 9001 §8.2). Null until those arrive (or forever, if a server
+  /// incorrectly omits the extension -- treated as "no additional
+  /// allowances known"). Callers (connection.dart) need the server's
+  /// initial_max_data / initial_max_stream_data_bidi_remote to know
+  /// how much they may send before the peer must grant more window.
+  TransportParameters? serverTransportParameters;
+
   ClientHandshake._({
     required SimpleKeyPair x25519KeyPair,
     required this.x25519PublicKey,
@@ -296,10 +305,7 @@ class ClientHandshake {
         await _handleServerHello(message, fullMessageBytes);
       case HandshakeType.encryptedExtensions:
         _transcript.addMessage(fullMessageBytes);
-      // Not otherwise inspected -- ALPN is fixed at the QUIC layer
-      // (ALPN="leaf-commander", negotiated outside TLS's own alpn
-      // extension per commander's transport design) and this client
-      // doesn't act on any other EncryptedExtensions content.
+        _parseEncryptedExtensions(message.body);
       case HandshakeType.certificateRequest:
         _transcript.addMessage(fullMessageBytes);
         _certificateRequest = CertificateRequest.decodeBody(message.body);
@@ -488,6 +494,28 @@ class ClientHandshake {
     }
     throw HandshakeException(
         'unsupported client private key type ${key.runtimeType}');
+  }
+
+  /// Extracts the server's QUIC transport parameters from
+  /// EncryptedExtensions (RFC 9001 §8.2: the server's parameters ride
+  /// the quic_transport_parameters extension, type 0x0039). A missing
+  /// extension leaves [serverTransportParameters] null -- a conforming
+  /// QUIC server always sends it, so absence is tolerated (null) rather
+  /// than failing the handshake, and callers treat it as "no send
+  /// allowance information; rely on MAX_DATA updates once data flows".
+  void _parseEncryptedExtensions(Uint8List body) {
+    try {
+      final extResult = decodeExtensionList(body, 0);
+      for (final ext in extResult.extensions) {
+        if (ext.type == ExtensionType.quicTransportParameters) {
+          serverTransportParameters = TransportParameters.decode(ext.data);
+          return;
+        }
+      }
+    } catch (_) {
+      // Malformed/missing extension list: leave serverTransportParameters
+      // null; the connection still works off MAX_DATA updates alone.
+    }
   }
 
   /// The Handshake-level traffic secrets, available once the

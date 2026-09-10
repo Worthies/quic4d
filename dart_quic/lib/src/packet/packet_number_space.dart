@@ -13,6 +13,7 @@ import 'dart:typed_data';
 
 import '../handshake/client_handshake.dart' show HandshakeSecretsSnapshot;
 import '../recovery/loss_detection.dart';
+import '../recovery/received_packet_tracker.dart';
 import '../recovery/rtt_estimator.dart';
 import '../tls/hkdf_label.dart';
 import '../tls/key_schedule.dart';
@@ -159,6 +160,15 @@ class PacketNumberSpace {
   int _nextPacketNumber = 0;
   int? largestReceivedPacketNumber;
   final LossDetector lossDetector;
+
+  /// Every packet number successfully received in this space, kept as
+  /// a contiguous frontier + reordered stragglers so ACK frames can
+  /// honestly acknowledge everything received (multiple ranges), not
+  /// just the single largest packet -- see ReceivedPacketTracker's doc
+  /// for the traffic-amplification bug the old largest-only ACK
+  /// caused.
+  final ReceivedPacketTracker received = ReceivedPacketTracker();
+
   final PacketNumberSpaceKeys keys = PacketNumberSpaceKeys();
   bool discarded = false;
 

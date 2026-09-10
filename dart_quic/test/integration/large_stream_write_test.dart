@@ -41,7 +41,14 @@ void main() {
     }
   });
 
-  for (final sizeBytes in [64 * 1024, 2 * 1024 * 1024]) {
+  // 12 MiB deliberately exceeds dart_quic's advertised 10 MiB initial
+  // flow-control windows in BOTH directions: the outbound half can only
+  // complete if the client honors the server's MAX_DATA/MAX_STREAM_DATA
+  // grants, and the echoed inbound half only if the client sends its own
+  // window updates -- before flow control was implemented, the server
+  // would silently stop sending at the 10 MiB mark (stall -> watchdog
+  // reconnect loop in production).
+  for (final sizeBytes in [64 * 1024, 2 * 1024 * 1024, 12 * 1024 * 1024]) {
     test(
         'write() round-trips a $sizeBytes-byte payload against a real '
         'quic-go server', () async {

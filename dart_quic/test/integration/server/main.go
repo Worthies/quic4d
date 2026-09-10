@@ -14,13 +14,21 @@ import (
 )
 
 // Minimal quic-go server mirroring leaf's server/quic_visitor.go ALPN +
-// mTLS config, for dart_quic's integration test. Reads one line
-// (newline-delimited, matching commander's wire framing) from the
-// client's first bidi stream, echoes it back with a prefix, then exits
-// after handling one connection.
+// mTLS config, for dart_quic's integration test. Reads newline-
+// delimited lines (matching commander's wire framing) from the
+// client's first bidi stream in a loop, echoing each back with a
+// prefix, until the stream is closed by the peer or an optional
+// message-count limit (3rd CLI arg, default: unlimited until EOF) is
+// reached, then exits.
 func main() {
 	certDir := os.Args[1]
 	addr := os.Args[2]
+	maxMessages := -1 // unlimited -- read until the client closes the stream
+	if len(os.Args) > 3 {
+		if n, err := fmt.Sscanf(os.Args[3], "%d", &maxMessages); err != nil || n != 1 {
+			log.Fatalf("invalid max-messages argument: %v", os.Args[3])
+		}
+	}
 
 	caCert, err := os.ReadFile(certDir + "/ca.crt")
 	if err != nil {
@@ -67,17 +75,22 @@ func main() {
 	}
 
 	reader := bufio.NewReader(stream)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		log.Fatalf("read: %v", err)
-	}
-	log.Printf("received: %q", line)
+	count := 0
+	for maxMessages < 0 || count < maxMessages {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("read ended: %v", err)
+			break
+		}
+		log.Printf("received: %q", line)
+		count++
 
-	reply := "echo:" + line
-	if _, err := stream.Write([]byte(reply)); err != nil {
-		log.Fatalf("write: %v", err)
+		reply := "echo:" + line
+		if _, err := stream.Write([]byte(reply)); err != nil {
+			log.Fatalf("write: %v", err)
+		}
+		log.Printf("sent: %q", reply)
 	}
-	log.Printf("sent: %q", reply)
 
 	time.Sleep(200 * time.Millisecond)
 	stream.Close()

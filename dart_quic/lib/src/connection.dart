@@ -25,6 +25,7 @@ import 'packet/initial_secrets.dart';
 import 'packet/packet_codec.dart';
 import 'packet/packet_number_space.dart';
 import 'recovery/congestion_control.dart';
+import 'recovery/loss_detection.dart' show LostPacket;
 import 'recovery/rtt_estimator.dart';
 import 'recovery/sent_packet.dart';
 import 'tls/transport_parameters.dart';
@@ -134,8 +135,29 @@ class Connection {
   ConnectionState state = ConnectionState.connecting;
   QuicStream? _stream;
   Timer? _pingTimer;
+  Timer? _lossDetectionTimer;
+  Timer? _idleTimeoutTimer;
   final StreamController<void> _handshakeCompleteController =
       StreamController<void>.broadcast();
+
+  /// RFC 9000 §10.1: the connection is idle-timed-out if no packet has
+  /// been received from the peer for this long. DESIGN.md fixes this
+  /// at 30s to match agents/quic_conn.go and server/quic_visitor.go's
+  /// shared quicKeepaliveConfig.MaxIdleTimeout -- both peers use the
+  /// same value, so whichever side's timer fires first tears down the
+  /// connection.
+  static const Duration _maxIdleTimeout = Duration(seconds: 30);
+  DateTime _lastPacketReceivedAt = DateTime.now();
+
+  final StreamController<void> _connectionClosedController =
+      StreamController<void>.broadcast();
+
+  /// Fires (once) when the connection transitions to
+  /// [ConnectionState.closed] for any reason -- idle timeout, a
+  /// received CONNECTION_CLOSE, or an explicit [close] call. Lets
+  /// commander's transport layer detect an unexpected drop without
+  /// polling [state].
+  Stream<void> get onClosed => _connectionClosedController.stream;
 
   Connection._({
     required Uint8List destinationConnectionId,
@@ -230,6 +252,7 @@ class Connection {
 
     _handshake.start();
     await _flushHandshakeOutbound();
+    _rearmLossDetectionTimer(); // covers the handshake's own PTO too
 
     final completer = Completer<void>();
     final sub = _handshakeCompleteController.stream.listen((_) {
@@ -244,7 +267,10 @@ class Connection {
     }
 
     state = ConnectionState.connected;
+    _lastPacketReceivedAt = DateTime.now();
     _startPingTimer();
+    _startIdleTimeoutTimer();
+    _rearmLossDetectionTimer();
   }
 
   /// Serializes datagram processing: [_onSocketEvent] fires
@@ -275,6 +301,11 @@ class Connection {
   }
 
   Future<void> _handleDatagram(Uint8List datagram) async {
+    // RFC 9000 §10.1: receipt of *any* packet from the peer resets the
+    // idle timeout, not just ack-eliciting ones -- a datagram merely
+    // needs to arrive to prove the path is still alive.
+    _lastPacketReceivedAt = DateTime.now();
+    if (state != ConnectionState.closed) _startIdleTimeoutTimer();
     var offset = 0;
     while (offset < datagram.length) {
       final firstByte = datagram[offset];
@@ -469,7 +500,8 @@ class Connection {
       } else if (frame is StreamFrame) {
         _stream?._handleFrame(frame);
       } else if (frame is ConnectionCloseFrame) {
-        state = ConnectionState.closed;
+        unawaited(_closeInternal());
+        return;
       }
       // PADDING/PING/HANDSHAKE_DONE and the decode-only frames
       // (flow_control_frames.dart etc.) need no action per DESIGN.md's
@@ -491,6 +523,7 @@ class Connection {
       if (result.newlyLost.isNotEmpty) {
         _congestion.onPacketsLost(
             result.newlyLost.map((l) => l.packet).toList(), DateTime.now());
+        await _retransmitLostPackets(result.newlyLost, space: space);
       }
     }
 
@@ -505,6 +538,98 @@ class Connection {
       }
       _handshakeCompleteController.add(null);
     }
+    _rearmLossDetectionTimer();
+  }
+
+  /// RFC 9000 §13.3: retransmits the CRYPTO/STREAM frames a
+  /// now-declared-lost packet carried, in a *new* packet with a new
+  /// packet number (lost packet numbers are never reused). Bare
+  /// ACK/PING-only packets ([SentPacket.retransmittableFrames] null)
+  /// need no action here -- losing an ACK is harmless (the next ACK
+  /// covers the same ground), and losing a keepalive PING is handled
+  /// by the PTO timer naturally sending another ack-eliciting packet
+  /// if the connection is otherwise idle.
+  Future<void> _retransmitLostPackets(
+    List<LostPacket> lostPackets, {
+    required PacketNumberSpace space,
+  }) async {
+    for (final lost in lostPackets) {
+      final frames = lost.packet.retransmittableFrames;
+      if (frames == null || frames.isEmpty) continue;
+      for (final frame in frames) {
+        if (frame is CryptoFrame) {
+          await _retransmitCryptoFrame(frame, space: space);
+        } else if (frame is StreamFrame) {
+          await _retransmitStreamFrame(frame);
+        }
+        // Other frame types are never placed in
+        // retransmittableFrames by this connection's own send paths
+        // (see the SentPacket construction sites) -- nothing else to
+        // handle here.
+      }
+    }
+  }
+
+  Future<void> _retransmitCryptoFrame(
+    CryptoFrame frame, {
+    required PacketNumberSpace space,
+  }) async {
+    if (!space.keys.hasKeys) return; // keys already discarded; nothing to do
+    final type = identical(space, _initialSpace)
+        ? LongPacketType.initial
+        : LongPacketType.handshake;
+    final packetNumber = space.allocatePacketNumber();
+    final pnLength =
+        packetNumberEncodingLength(packetNumber, space.largestAckedPacket);
+    final built = await buildLongHeaderPacket(
+      type: type,
+      version: quicVersion1,
+      destinationConnectionId: _destinationConnectionId,
+      sourceConnectionId: _sourceConnectionId,
+      token: Uint8List(0),
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keys: space.keys.client!,
+      frames: [frame],
+    );
+    space.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+      retransmittableFrames: [frame],
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    final datagram = type == LongPacketType.initial
+        ? _padDatagramTo(built.bytes, kMinimumInitialDatagramSize)
+        : built.bytes;
+    _sendDatagram(datagram);
+  }
+
+  Future<void> _retransmitStreamFrame(StreamFrame frame) async {
+    if (!_oneRttSpace.keys.hasKeys) return;
+    final packetNumber = _oneRttSpace.allocatePacketNumber();
+    final pnLength = packetNumberEncodingLength(
+        packetNumber, _oneRttSpace.largestAckedPacket);
+    final built = await buildShortHeaderPacket(
+      destinationConnectionId: _destinationConnectionId,
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keyPhase: false,
+      keys: _oneRttSpace.keys.client!,
+      frames: [frame],
+    );
+    _oneRttSpace.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+      retransmittableFrames: [frame],
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    _sendDatagram(built.bytes);
   }
 
   Future<void> _maybeInstallLaterKeys() async {
@@ -584,6 +709,7 @@ class Connection {
       inFlight: true,
       sentBytes: built.bytes.length,
       timeSent: DateTime.now(),
+      retransmittableFrames: [frame],
     ));
     _congestion.onPacketSent(built.bytes.length);
 
@@ -640,10 +766,12 @@ class Connection {
       inFlight: true,
       sentBytes: built.bytes.length,
       timeSent: DateTime.now(),
+      retransmittableFrames: [frame],
     ));
     _congestion.onPacketSent(built.bytes.length);
 
     _sendDatagram(built.bytes);
+    _rearmLossDetectionTimer();
   }
 
   void _sendDatagram(Uint8List bytes) {
@@ -697,14 +825,196 @@ class Connection {
       sentBytes: built.bytes.length,
       timeSent: DateTime.now(),
     ));
+    _congestion.onPacketSent(built.bytes.length);
     _sendDatagram(built.bytes);
+    _rearmLossDetectionTimer();
   }
 
-  Future<void> close() async {
+  /// RFC 9000 §10.1: closes the connection locally (no CONNECTION_CLOSE
+  /// is sent -- the peer has, by definition, been unreachable for the
+  /// whole idle timeout, so there is no one to send it to) once no
+  /// packet has been received from the peer for [_maxIdleTimeout].
+  /// Re-armed after every received packet and after every ack-eliciting
+  /// send that follows a receive (RFC 9000 §10.1's "restarts its idle
+  /// timer when sending an ack-eliciting packet if no other ack-
+  /// eliciting packets have been sent since last receiving" — approximated
+  /// here by simply re-arming on every receipt, which is simpler and
+  /// only makes the timeout slightly more generous, never less).
+  void _startIdleTimeoutTimer() {
+    _idleTimeoutTimer?.cancel();
+    _idleTimeoutTimer = Timer(_maxIdleTimeout, _onIdleTimeout);
+  }
+
+  void _onIdleTimeout() {
+    final sinceLastPacket = DateTime.now().difference(_lastPacketReceivedAt);
+    if (sinceLastPacket < _maxIdleTimeout) {
+      // A packet arrived since this timer was scheduled but the timer
+      // wasn't re-armed in time (e.g. it fired concurrently with
+      // _handleDatagram) -- reschedule for the real remaining time
+      // instead of closing prematurely.
+      _idleTimeoutTimer =
+          Timer(_maxIdleTimeout - sinceLastPacket, _onIdleTimeout);
+      return;
+    }
+    unawaited(_closeInternal());
+  }
+
+  /// RFC 9002 §6.2/Appendix A.8-A.9: a single cross-space loss
+  /// detection timer, re-armed after every send/receive/loss event.
+  /// When it fires with no time-threshold loss pending, it's a PTO:
+  /// send a probe (PING, since dart_quic has no queued-but-unsent data
+  /// concept beyond what's already been sent -- see DESIGN.md's scope)
+  /// in whichever space most urgently needs one.
+  void _rearmLossDetectionTimer() {
+    _lossDetectionTimer?.cancel();
+    if (state == ConnectionState.closed) return;
+
+    final spaces = [_initialSpace, _handshakeSpace, _oneRttSpace];
+    DateTime? earliestLossTime;
+    for (final space in spaces) {
+      final lt = space.lossDetector.lossTime;
+      if (lt != null &&
+          (earliestLossTime == null || lt.isBefore(earliestLossTime))) {
+        earliestLossTime = lt;
+      }
+    }
+    if (earliestLossTime != null) {
+      final delay = earliestLossTime.difference(DateTime.now());
+      _lossDetectionTimer = Timer(
+          delay.isNegative ? Duration.zero : delay, _onLossDetectionTimeout);
+      return;
+    }
+
+    // No time-threshold loss pending -- schedule the earliest PTO
+    // across the spaces that currently have anything ack-eliciting in
+    // flight (1-RTT's PTO is intentionally not armed until the
+    // handshake is confirmed, matching RFC 9000 §6.2.1's "MUST NOT set
+    // its PTO timer for the Application Data packet number space until
+    // the handshake is confirmed").
+    const zeroAckDelay = Duration.zero;
+    const oneRttMaxAckDelay = Duration(milliseconds: 25);
+    DateTime? earliestPto;
+    for (final space in [_initialSpace, _handshakeSpace]) {
+      final pto = space.lossDetector.ptoDeadline(zeroAckDelay);
+      if (pto != null && (earliestPto == null || pto.isBefore(earliestPto))) {
+        earliestPto = pto;
+      }
+    }
+    if (_handshake.isComplete) {
+      final pto = _oneRttSpace.lossDetector.ptoDeadline(oneRttMaxAckDelay);
+      if (pto != null && (earliestPto == null || pto.isBefore(earliestPto))) {
+        earliestPto = pto;
+      }
+    }
+    if (earliestPto == null) return; // nothing in flight anywhere
+    final delay = earliestPto.difference(DateTime.now());
+    _lossDetectionTimer = Timer(
+        delay.isNegative ? Duration.zero : delay, _onLossDetectionTimeout);
+  }
+
+  void _onLossDetectionTimeout() {
+    unawaited(_handleLossDetectionTimeout());
+  }
+
+  Future<void> _handleLossDetectionTimeout() async {
+    final now = DateTime.now();
+    for (final space in [_initialSpace, _handshakeSpace, _oneRttSpace]) {
+      if (space.lossDetector.lossTime != null &&
+          !space.lossDetector.lossTime!.isAfter(now)) {
+        final lost = space.lossDetector.detectLossOnTimeout(now);
+        if (lost.isNotEmpty) {
+          _congestion.onPacketsLost(lost.map((l) => l.packet).toList(), now);
+          await _retransmitLostPackets(lost, space: space);
+        }
+        _rearmLossDetectionTimer();
+        return;
+      }
+    }
+
+    // No time-threshold loss was pending -- this is a PTO firing.
+    // Send a probe: PING in the space whose PTO is earliest / whichever
+    // has ack-eliciting data in flight. A bare PING is sufficient (RFC
+    // 9002 §6.2: "If neither is available, send a single PING frame").
+    await _sendProbe();
+    for (final space in [_initialSpace, _handshakeSpace, _oneRttSpace]) {
+      if (space.lossDetector.hasAckElicitingInFlight) {
+        space.lossDetector.onPtoFired(now);
+      }
+    }
+    _rearmLossDetectionTimer();
+  }
+
+  Future<void> _sendProbe() async {
+    if (_initialSpace.keys.hasKeys &&
+        _initialSpace.lossDetector.hasAckElicitingInFlight) {
+      await _sendPingInLongHeaderSpace(_initialSpace, LongPacketType.initial);
+      return;
+    }
+    if (_handshakeSpace.keys.hasKeys &&
+        _handshakeSpace.lossDetector.hasAckElicitingInFlight) {
+      await _sendPingInLongHeaderSpace(
+          _handshakeSpace, LongPacketType.handshake);
+      return;
+    }
+    if (_handshake.isComplete && _oneRttSpace.keys.hasKeys) {
+      await _sendPing();
+    }
+  }
+
+  /// RFC 9002 §6.2's PTO probe for the Initial/Handshake spaces: a bare
+  /// PING frame (not a CRYPTO retransmission -- the lost CRYPTO data,
+  /// if any, is retransmitted separately by [_retransmitLostPackets]
+  /// once loss is actually detected; this probe's only job is to
+  /// elicit an ACK so that detection can happen at all on a link that
+  /// dropped every packet in a flight).
+  Future<void> _sendPingInLongHeaderSpace(
+      PacketNumberSpace space, LongPacketType type) async {
+    final packetNumber = space.allocatePacketNumber();
+    final pnLength =
+        packetNumberEncodingLength(packetNumber, space.largestAckedPacket);
+    final built = await buildLongHeaderPacket(
+      type: type,
+      version: quicVersion1,
+      destinationConnectionId: _destinationConnectionId,
+      sourceConnectionId: _sourceConnectionId,
+      token: Uint8List(0),
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keys: space.keys.client!,
+      frames: const [PingFrame()],
+    );
+    space.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    final datagram = type == LongPacketType.initial
+        ? _padDatagramTo(built.bytes, kMinimumInitialDatagramSize)
+        : built.bytes;
+    _sendDatagram(datagram);
+  }
+
+  Future<void> _closeInternal() async {
+    if (state == ConnectionState.closed) return;
     _pingTimer?.cancel();
+    _idleTimeoutTimer?.cancel();
+    _lossDetectionTimer?.cancel();
     state = ConnectionState.closed;
     await _stream?.close();
     _socket?.close();
-    await _handshakeCompleteController.close();
+    if (!_connectionClosedController.isClosed) {
+      _connectionClosedController.add(null);
+      await _connectionClosedController.close();
+    }
+  }
+
+  Future<void> close() async {
+    await _closeInternal();
+    if (!_handshakeCompleteController.isClosed) {
+      await _handshakeCompleteController.close();
+    }
   }
 }

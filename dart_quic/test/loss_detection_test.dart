@@ -277,4 +277,135 @@ void main() {
       expect(result.newlyLost, isEmpty);
     });
   });
+
+  group('PTO scheduling (RFC 9002 SS6.2)', () {
+    test('ptoDeadline is null with nothing ack-eliciting in flight', () {
+      final detector = LossDetector(RttEstimator());
+      expect(detector.ptoDeadline(const Duration(milliseconds: 25)), isNull);
+    });
+
+    test(
+        'ptoDeadline is timeOfLastAckElicitingPacket + PTO on the '
+        'first probe', () {
+      final detector = LossDetector(RttEstimator());
+      final sentAt = DateTime(2024, 1, 1);
+      detector.onPacketSent(SentPacket(
+        packetNumber: 0,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: sentAt,
+      ));
+      final maxAckDelay = const Duration(milliseconds: 25);
+      final expectedPto = detector.rtt.computePto(maxAckDelay);
+      expect(detector.ptoDeadline(maxAckDelay), sentAt.add(expectedPto));
+    });
+
+    test('onPtoFired doubles the backoff for the next deadline', () {
+      final detector = LossDetector(RttEstimator());
+      final sentAt = DateTime(2024, 1, 1);
+      detector.onPacketSent(SentPacket(
+        packetNumber: 0,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: sentAt,
+      ));
+      final maxAckDelay = const Duration(milliseconds: 25);
+      final basePto = detector.rtt.computePto(maxAckDelay);
+
+      final firedAt = sentAt.add(basePto);
+      detector.onPtoFired(firedAt);
+      expect(detector.ptoCount, 1);
+      // Second PTO backs off by 2x from the new anchor time.
+      expect(detector.ptoDeadline(maxAckDelay), firedAt.add(basePto * 2));
+
+      detector.onPtoFired(firedAt.add(basePto * 2));
+      expect(detector.ptoCount, 2);
+    });
+
+    test(
+        'ptoDeadline returns null once every ack-eliciting packet has '
+        'been acknowledged, even though a PTO fired earlier (regression: '
+        'this previously kept computing a deadline from a stale '
+        'timeOfLastAckElicitingPacket forever, causing an infinite '
+        'probe storm once a connection went idle after real traffic)', () {
+      final detector = LossDetector(RttEstimator());
+      final sentAt = DateTime(2024, 1, 1);
+      final maxAckDelay = const Duration(milliseconds: 25);
+      detector.onPacketSent(SentPacket(
+        packetNumber: 0,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: sentAt,
+      ));
+      expect(detector.ptoDeadline(maxAckDelay), isNotNull);
+
+      detector.onAckReceived(
+        acknowledgedPacketNumbers: [0],
+        ackDelay: Duration.zero,
+        handshakeConfirmed: true,
+        maxAckDelay: maxAckDelay,
+        now: sentAt.add(const Duration(milliseconds: 50)),
+      );
+
+      expect(detector.ptoDeadline(maxAckDelay), isNull);
+    });
+
+    test('a successful ACK resets ptoCount back to 0', () {
+      final detector = LossDetector(RttEstimator());
+      final sentAt = DateTime(2024, 1, 1);
+      detector.onPacketSent(SentPacket(
+        packetNumber: 0,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: sentAt,
+      ));
+      detector.onPtoFired(sentAt);
+      expect(detector.ptoCount, 1);
+
+      detector.onAckReceived(
+        acknowledgedPacketNumbers: [0],
+        ackDelay: Duration.zero,
+        handshakeConfirmed: false,
+        maxAckDelay: const Duration(milliseconds: 25),
+        now: sentAt.add(const Duration(milliseconds: 50)),
+      );
+      expect(detector.ptoCount, 0);
+    });
+
+    test(
+        'ackElicitingInFlightPackets excludes non-ack-eliciting and '
+        'not-in-flight packets, sorted by packet number', () {
+      final detector = LossDetector(RttEstimator());
+      final now = DateTime(2024, 1, 1);
+      detector.onPacketSent(SentPacket(
+        packetNumber: 2,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: now,
+      ));
+      detector.onPacketSent(SentPacket(
+        packetNumber: 1,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 100,
+        timeSent: now,
+      ));
+      detector.onPacketSent(SentPacket(
+        packetNumber: 3,
+        ackEliciting: false,
+        inFlight: false,
+        sentBytes: 50,
+        timeSent: now,
+      ));
+      expect(
+        detector.ackElicitingInFlightPackets.map((p) => p.packetNumber),
+        [1, 2],
+      );
+    });
+  });
 }

@@ -59,6 +59,53 @@ class LossDetector {
     }
   }
 
+  /// Every currently-tracked ack-eliciting, in-flight packet, oldest
+  /// first -- used both for PTO probing (RFC 9002 §6.2:
+  /// "SendOneOrTwoAckElicitingPackets") and to answer "is there
+  /// anything left to lose/retransmit" without exposing the full
+  /// internal map.
+  List<SentPacket> get ackElicitingInFlightPackets {
+    final packets = _sentPackets.values
+        .where((p) => p.ackEliciting && p.inFlight)
+        .toList()
+      ..sort((a, b) => a.packetNumber.compareTo(b.packetNumber));
+    return packets;
+  }
+
+  /// RFC 9002 §6.2.1: the deadline at which a Probe Timeout fires for
+  /// this space, or null if there's nothing ack-eliciting in flight to
+  /// probe for (matching the RFC's "no ack-eliciting packets in
+  /// flight" PTO-skip condition, modulo the anti-deadlock case handled
+  /// separately by the connection layer since it needs cross-space
+  /// context this per-space detector doesn't have).
+  DateTime? ptoDeadline(Duration maxAckDelay) {
+    if (!hasAckElicitingInFlight) return null;
+    final lastSent = timeOfLastAckElicitingPacket;
+    if (lastSent == null) return null;
+    final basePto = rtt.computePto(maxAckDelay);
+    final backoff = 1 << ptoCount.clamp(0, 20); // cap to avoid overflow
+    return lastSent.add(basePto * backoff);
+  }
+
+  /// RFC 9002 Appendix A.9 (the timeout branch): call when a PTO fires
+  /// for this space -- increments [ptoCount] (exponential backoff for
+  /// the next PTO) and resets [timeOfLastAckElicitingPacket] so a probe
+  /// packet's own send time anchors the next deadline, matching how a
+  /// real ack-eliciting send would.
+  void onPtoFired(DateTime now) {
+    ptoCount++;
+    timeOfLastAckElicitingPacket = now;
+  }
+
+  /// RFC 9002 Appendix A.7 (tail): resets the PTO backoff once an ACK
+  /// actually makes progress (a full "address validated" check is not
+  /// implemented -- see DESIGN.md scope -- so this simplifies to "any
+  /// newly-acked packet resets it," which is the common case for a
+  /// short-lived, low-reordering link).
+  void resetPtoCount() {
+    ptoCount = 0;
+  }
+
   /// RFC 9002 Appendix A.7/A.10: processes a received ACK's
   /// acknowledged packet-number list, updating RTT (via [rtt]) when
   /// applicable, then runs time-threshold loss detection. [now] is
@@ -91,6 +138,7 @@ class LossDetector {
     if (newlyAcked.isEmpty) {
       return const AckResult(newlyAcked: [], newlyLost: []);
     }
+    resetPtoCount();
 
     final largestAckedInFlight =
         newlyAcked.where((p) => p.packetNumber == largestInThisAck).toList();

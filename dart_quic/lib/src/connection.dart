@@ -20,6 +20,7 @@ import 'dart:typed_data';
 
 import 'frame/frame_codec.dart';
 import 'handshake/client_handshake.dart';
+import 'diagnostics.dart';
 import 'packet/header.dart';
 import 'packet/initial_secrets.dart';
 import 'packet/packet_codec.dart';
@@ -159,13 +160,46 @@ class QuicStream {
   static const int clientBidiStreamId0 = 0;
 
   final Connection _connection;
-  final StreamController<Uint8List> _incomingController =
-      StreamController<Uint8List>.broadcast();
+  // Broadcast semantics are kept (multiple listeners allowed, late
+  // subscribers see only future data), but a broadcast StreamController
+  // DROPS events added while nobody is listening. That is wrong for
+  // stream data: bytes arrive from the network the moment the peer
+  // sends them, which can precede the app's first listen() by an
+  // arbitrary margin (commander's first-entry bug: the server's
+  // welcome message landed between openBi()/writeAll() and the read
+  // loop's listen(), and was silently discarded -- empty visitor
+  // panel, nothing received until a forced reconnect). So chunks
+  // delivered before the first listener are parked here and replayed
+  // in order on listen.
+  final List<Uint8List> _pendingBeforeFirstListener = [];
+  late final StreamController<Uint8List> _incomingController;
   int _sendOffset = 0;
-  late final StreamReassembler _reassembler =
-      StreamReassembler(_incomingController.add);
+  late final StreamReassembler _reassembler = StreamReassembler(_deliver);
 
-  QuicStream._(this._connection);
+  QuicStream._(this._connection) {
+    _incomingController = StreamController<Uint8List>.broadcast(
+      onListen: _replayParkedChunks,
+    );
+  }
+
+  void _replayParkedChunks() {
+    final parked = List<Uint8List>.from(_pendingBeforeFirstListener);
+    _pendingBeforeFirstListener.clear();
+    for (final chunk in parked) {
+      _incomingController.add(chunk);
+    }
+  }
+
+  void _deliver(Uint8List data) {
+    if (!_incomingController.hasListener) {
+      // No listener yet: park the chunk (bounded by the receive
+      // flow-control window, i.e. no more than what a listening app
+      // would have buffered anyway) and replay on the first listen().
+      _pendingBeforeFirstListener.add(data);
+      return;
+    }
+    _incomingController.add(data);
+  }
 
   /// Bytes received on this stream, in order, as they arrive --
   /// possibly split across multiple events per STREAM frame rather
@@ -461,7 +495,12 @@ class Connection {
         (Object e, StackTrace st) {
           // Diagnostics only, RFC 9000 §12.2 discard-and-continue applies
           // regardless: swallow it rather than letting it escape to the
-          // socket-event handler.
+          // socket-event handler -- but report it, since a recurring
+          // exception here is exactly the "messages silently stop"
+          // class of failure that is otherwise invisible.
+          QuicDiagnostics.report(
+              'datagram processing failed (${e.runtimeType}): $e @ '
+              '${st.toString().split('\n').take(3).join(' | ')}');
         },
       );
     }
@@ -536,6 +575,11 @@ class Connection {
       // else is coalesced, but since the Length field is inside the
       // still-unprotected header we already parsed, we know exactly
       // how many bytes to skip.
+      if (space.discarded) {
+        QuicDiagnostics.report(
+            'dropped ${peek.header.type.name} packet after key discard '
+            '(pn offset ${peek.packetNumberOffset}, len ${peek.length})');
+      }
       return peek.packetNumberOffset + peek.length;
     }
 
@@ -728,6 +772,10 @@ class Connection {
           _streamSendAllowance = frame.maximumStreamData - _streamBytesSent;
         }
       } else if (frame is ConnectionCloseFrame) {
+        QuicDiagnostics.report(
+            'peer closed connection: errorCode=${frame.errorCode} '
+            '${frame.isApplicationError ? '(application)' : '(transport)'}'
+            '${frame.reasonPhrase.isEmpty ? '' : ' reason="${frame.reasonPhrase}"'}');
         unawaited(_closeInternal());
         return;
       }

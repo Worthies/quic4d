@@ -10,3 +10,4 @@
 library;
 
 export 'src/api.dart';
+export 'src/diagnostics.dart';

@@ -402,6 +402,12 @@ class Connection {
       handshakeTimeout: handshakeTimeout,
     );
 
+    // Immediate 1-RTT liveness probe (see _noteProbeSent): fires the
+    // first keepalive-style ping right away instead of waiting for the
+    // 10s periodic timer, so a dead uplink is reported within ~3s of
+    // connect rather than 13s.
+    connection._guardLocalSend('probe ping', connection._sendPing);
+
     return connection;
   }
 
@@ -575,10 +581,17 @@ class Connection {
       // else is coalesced, but since the Length field is inside the
       // still-unprotected header we already parsed, we know exactly
       // how many bytes to skip.
-      if (space.discarded) {
+      if (space.discarded && !_reportedLateHandshakePackets) {
+        // Late Handshake retransmissions after handshake confirmation
+        // are NORMAL (RFC 9001 §4.9.2 drops them by design); report the
+        // condition once per connection instead of per packet so the
+        // diagnostic stream stays useful.
+        _reportedLateHandshakePackets = true;
         QuicDiagnostics.report(
-            'dropped ${peek.header.type.name} packet after key discard '
-            '(pn offset ${peek.packetNumberOffset}, len ${peek.length})');
+            'dropping late handshake retransmissions (keys already '
+            'discarded after handshake confirmation) -- first of them: '
+            '${peek.header.type.name} pn offset '
+            '${peek.packetNumberOffset}, len ${peek.length}');
       }
       return peek.packetNumberOffset + peek.length;
     }
@@ -778,11 +791,26 @@ class Connection {
             '${frame.reasonPhrase.isEmpty ? '' : ' reason="${frame.reasonPhrase}"'}');
         unawaited(_closeInternal());
         return;
+      } else if (frame is PathChallengeFrame && level == EncryptionLevel.oneRtt) {
+        // RFC 9000 §8.2.2: an endpoint MUST respond to a PATH_CHALLENGE
+        // with a PATH_RESPONSE carrying the identical data, in a
+        // packet sent on the path the challenge was received on. This
+        // was previously silently ignored -- after a mobile NAT rebind
+        // (WiFi<->cellular handover), the server issues a
+        // PATH_CHALLENGE on the new path; without a response, quic-go
+        // keeps that path unvalidated and subject to the anti-
+        // amplification limit (~3x bytes received), so small ACK-only
+        // exchanges kept working while the much larger welcome/
+        // visitors/history replies silently never made it through --
+        // exactly the field-observed "1-RTT probe ACKs, application
+        // layer never responds" pattern on some reconnects.
+        unawaited(_sendPathResponse(frame.data));
       }
-      // PADDING/PING/HANDSHAKE_DONE and the remaining decode-only
-      // frames (BLOCKED/MAX_STREAMS variants etc.) need no action per
-      // DESIGN.md's scope -- they're accepted (so decoding never
-      // breaks) but not acted on.
+      // PADDING/PING/HANDSHAKE_DONE, PATH_RESPONSE (we never probe a
+      // path ourselves, so we never expect one back) and the
+      // remaining decode-only frames (BLOCKED/MAX_STREAMS variants
+      // etc.) need no action per DESIGN.md's scope -- they're
+      // accepted (so decoding never breaks) but not acted on.
     }
 
     if (acknowledgedPns.isNotEmpty) {
@@ -796,6 +824,7 @@ class Connection {
       for (final acked in result.newlyAcked) {
         _congestion.onPacketAcked(acked);
       }
+      _noteProbeAcked(result.newlyAcked.map((p) => p.packetNumber));
       if (result.newlyLost.isNotEmpty) {
         _congestion.onPacketsLost(
             result.newlyLost.map((l) => l.packet).toList(), DateTime.now());
@@ -1136,6 +1165,7 @@ class Connection {
   /// Re-entrant calls return immediately; the running loop re-reads
   /// the gates each iteration, so no wakeup is lost.
   bool _flushPendingSendsInFlight = false;
+  bool _reportedLateHandshakePackets = false;
   Future<void> _flushPendingSends() async {
     if (_flushPendingSendsInFlight) return;
     _flushPendingSendsInFlight = true;
@@ -1234,7 +1264,7 @@ class Connection {
     // to go out -- send a packet now rather than waiting for the next
     // piggyback opportunity that may never come.
     if (updateNeeded && _pendingFlowControlFrames.isNotEmpty) {
-      unawaited(_sendFlowControlUpdate());
+      _guardLocalSend('flow-control update', _sendFlowControlUpdate);
     }
   }
 
@@ -1299,7 +1329,8 @@ class Connection {
     // (matches agents/quic_conn.go and server/quic_visitor.go's shared
     // 10s KeepAlivePeriod).
     _pingTimer = Timer.periodic(
-        const Duration(seconds: 10), (_) => unawaited(_sendPing()));
+        const Duration(seconds: 10),
+        (_) => _guardLocalSend('keepalive ping', _sendPing));
   }
 
   Future<void> _sendPing() async {
@@ -1325,8 +1356,78 @@ class Connection {
       timeSent: DateTime.now(),
     ));
     _congestion.onPacketSent(built.bytes.length);
+    if (!_probeResolved && _probePingPn == null) {
+      _noteProbeSent(packetNumber);
+    }
     _sendDatagram(built.bytes);
     _rearmLossDetectionTimer();
+  }
+
+  /// RFC 9000 §8.2.2: replies to a PATH_CHALLENGE with a PATH_RESPONSE
+  /// carrying the identical 8-byte data, so the server's path
+  /// validation (issued e.g. after observing our address change post
+  /// NAT rebind) succeeds and lifts the anti-amplification limit on
+  /// that path -- see _processFrames' PathChallengeFrame branch for
+  /// the full rationale.
+  Future<void> _sendPathResponse(Uint8List challengeData) async {
+    if (state != ConnectionState.connected || !_oneRttSpace.keys.hasKeys) {
+      return;
+    }
+    final packetNumber = _oneRttSpace.allocatePacketNumber();
+    final pnLength = packetNumberEncodingLength(
+        packetNumber, _oneRttSpace.largestAckedPacket);
+    final built = await buildShortHeaderPacket(
+      destinationConnectionId: _destinationConnectionId,
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
+      frames: [PathResponseFrame(data: challengeData)],
+    );
+    _oneRttSpace.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    _sendDatagram(built.bytes);
+    _rearmLossDetectionTimer();
+  }
+
+  // --- 1-RTT path probe -----------------------------------------------
+  // Diagnoses the "handshake succeeds but the server's welcome never
+  // arrives" class of failure (seen on HarmonyOS during network
+  // flapping): the FIRST 1-RTT keepalive ping's fate splits the world:
+  //   ACKed   -> path is bidirectional; a missing welcome is the
+  //              server's side (AcceptStream stuck / send failed /
+  //              server->client loss only)
+  //   unACKed -> our 1-RTT uplink is dead (one-way path); no server
+  //              behavior could ever deliver a welcome
+  // One report per connection, either way.
+  int? _probePingPn;
+  bool _probeResolved = false;
+  void _noteProbeSent(int packetNumber) {
+    _probePingPn = packetNumber;
+    Timer(const Duration(seconds: 3), () {
+      if (!_probeResolved && state == ConnectionState.connected) {
+        _probeResolved = true;
+        QuicDiagnostics.report(
+            'path probe: first 1-RTT ping (pn=$_probePingPn) NOT acked '
+            'within 3s — uplink likely one-way/dead');
+      }
+    });
+  }
+
+  void _noteProbeAcked(Iterable<int> ackedPns) {
+    if (_probeResolved || _probePingPn == null) return;
+    if (ackedPns.contains(_probePingPn)) {
+      _probeResolved = true;
+      QuicDiagnostics.report(
+          'path probe: server ACKed first 1-RTT ping (pn=$_probePingPn) — '
+          'path bidirectional; a missing welcome is server-side');
+    }
   }
 
   /// RFC 9000 §10.1: closes the connection locally (no CONNECTION_CLOSE
@@ -1412,7 +1513,22 @@ class Connection {
   }
 
   void _onLossDetectionTimeout() {
-    unawaited(_handleLossDetectionTimeout());
+    _guardLocalSend('loss detection', _handleLossDetectionTimeout);
+  }
+
+  /// Runs a fire-and-forget send path with a zombie-connection guard: a
+  /// local send failure (dead socket, e.g. errno 103 after a network
+  /// change) is unrecoverable for the connection -- every later send
+  /// hits the same dead socket -- but before this guard the exception
+  /// escaped to the platform dispatcher AND the connection stayed
+  /// "connected" until some watchdog noticed (observed live: a 45s
+  /// zombie window during which the app kept queueing into it).
+  void _guardLocalSend(String what, Future<void> Function() send) {
+    unawaited(send().catchError((Object e) {
+      QuicDiagnostics.report(
+          '$what failed with local send error, closing connection: $e');
+      unawaited(_closeInternal());
+    }));
   }
 
   Future<void> _handleLossDetectionTimeout() async {

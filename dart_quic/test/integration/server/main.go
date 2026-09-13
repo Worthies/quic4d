@@ -116,7 +116,21 @@ func main() {
 		trimmed := strings.TrimSpace(line)
 		var reply string
 		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
-			reply = line // valid-JSON-looking line: echo verbatim
+			// Minimal leaf semantics for the control messages
+			// commander's pull-based initialization sends right after
+			// connect, so the retry logic sees real replies instead of
+			// misreading an echo as silence; everything else echoes
+			// verbatim as before.
+			switch {
+			case strings.Contains(trimmed, `"type":"ping"`) ||
+				strings.Contains(trimmed, `"type": "ping"`):
+				reply = `{"type":"pong"}` + "\n"
+			case strings.Contains(trimmed, `"type":"get_visitors"`) ||
+				strings.Contains(trimmed, `"type": "get_visitors"`):
+				reply = `{"type":"visitors","visitor_name":"e2e-test-user","visitors":[]}` + "\n"
+			default:
+				reply = line // valid-JSON-looking line: echo verbatim
+			}
 		} else {
 			reply = "echo:" + line
 		}

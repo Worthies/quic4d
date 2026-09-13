@@ -11,7 +11,12 @@ import 'dart:math';
 class LossyUdpProxy {
   final int listenPort;
   final int targetPort;
-  final double dropProbability;
+  // Mutable (not final): some tests need to change the loss rate
+  // mid-run -- e.g. starting a connection loss-free so its handshake
+  // completes deterministically, then flipping loss on right as a
+  // specific post-handshake packet is sent, to test behavior under
+  // loss without also making the handshake itself flaky.
+  double dropProbability;
   final Random _random;
 
   RawDatagramSocket? _clientSocket;
@@ -21,6 +26,7 @@ class LossyUdpProxy {
 
   int droppedCount = 0;
   int forwardedCount = 0;
+  int serverToClientForwardedCount = 0;
 
   LossyUdpProxy({
     required this.listenPort,
@@ -60,6 +66,7 @@ class LossyUdpProxy {
       if (clientAddress == null || clientPort == null) return;
       // Server->client direction is never dropped -- this proxy only
       // needs to force *client* retransmissions for this test.
+      serverToClientForwardedCount++;
       _clientSocket!.send(datagram.data, clientAddress, clientPort);
     });
   }

@@ -265,6 +265,16 @@ class Connection {
   final Uint8List _sourceConnectionId;
   final ClientHandshake _handshake;
 
+  /// RFC 9001 §4.1.2: for a client, the handshake is *confirmed* only
+  /// on receiving HANDSHAKE_DONE -- distinct from [_handshake.isComplete],
+  /// which just means this client has locally finished computing its
+  /// own Finished message. Handshake-space keys/loss-detector state
+  /// must survive until confirmation (RFC 9001 §4.9.2), since the
+  /// client's own last handshake flight (Certificate/CertificateVerify/
+  /// Finished) is sent moments before isComplete flips true and still
+  /// needs to be retransmittable if lost.
+  bool _handshakeConfirmed = false;
+
   final RttEstimator _sharedRtt = RttEstimator();
   late final PacketNumberSpace _initialSpace;
   late final PacketNumberSpace _handshakeSpace;
@@ -791,7 +801,8 @@ class Connection {
             '${frame.reasonPhrase.isEmpty ? '' : ' reason="${frame.reasonPhrase}"'}');
         unawaited(_closeInternal());
         return;
-      } else if (frame is PathChallengeFrame && level == EncryptionLevel.oneRtt) {
+      } else if (frame is PathChallengeFrame &&
+          level == EncryptionLevel.oneRtt) {
         // RFC 9000 §8.2.2: an endpoint MUST respond to a PATH_CHALLENGE
         // with a PATH_RESPONSE carrying the identical data, in a
         // packet sent on the path the challenge was received on. This
@@ -805,19 +816,28 @@ class Connection {
         // exactly the field-observed "1-RTT probe ACKs, application
         // layer never responds" pattern on some reconnects.
         unawaited(_sendPathResponse(frame.data));
+      } else if (frame is HandshakeDoneFrame) {
+        // RFC 9000 §19.20 / RFC 9001 §4.1.2: HANDSHAKE_DONE is the
+        // client's only signal that the handshake is confirmed. Only
+        // now is it safe to discard Handshake-space keys/loss state
+        // (see _onHandshakeConfirmed) -- discarding as soon as this
+        // client locally finished its own Finished message wiped the
+        // retransmit state for that very flight before the server
+        // could possibly have ACKed it.
+        _onHandshakeConfirmed();
       }
-      // PADDING/PING/HANDSHAKE_DONE, PATH_RESPONSE (we never probe a
-      // path ourselves, so we never expect one back) and the
-      // remaining decode-only frames (BLOCKED/MAX_STREAMS variants
-      // etc.) need no action per DESIGN.md's scope -- they're
-      // accepted (so decoding never breaks) but not acted on.
+      // PADDING/PING, PATH_RESPONSE (we never probe a path ourselves,
+      // so we never expect one back) and the remaining decode-only
+      // frames (BLOCKED/MAX_STREAMS variants etc.) need no action per
+      // DESIGN.md's scope -- they're accepted (so decoding never
+      // breaks) but not acted on.
     }
 
     if (acknowledgedPns.isNotEmpty) {
       final result = space.lossDetector.onAckReceived(
         acknowledgedPacketNumbers: acknowledgedPns,
         ackDelay: Duration(microseconds: latestAckDelayMicros),
-        handshakeConfirmed: _handshake.isComplete,
+        handshakeConfirmed: _handshakeConfirmed,
         maxAckDelay: _serverMaxAckDelay,
         now: DateTime.now(),
       );
@@ -982,12 +1002,30 @@ class Connection {
 
     if (_handshake.isComplete && !_oneRttSpace.keys.hasKeys) {
       await _oneRttSpace.installKeys(_handshake.applicationTrafficSecrets);
-      // RFC 9001 §4.9.2: discard Handshake keys once the handshake is
-      // confirmed.
-      _handshakeSpace.discard();
+      // NOTE: Handshake-space keys/loss-detector state are NOT
+      // discarded here. RFC 9001 §4.9.2 discards them once the
+      // handshake is *confirmed* (§4.1.2: for a client, only upon
+      // receiving HANDSHAKE_DONE) -- not merely once this client has
+      // locally finished computing its own Finished message. The
+      // client's last Handshake-space flight (Certificate/
+      // CertificateVerify/Finished) is sent just before this point and
+      // must remain retransmittable if lost; discarding here wiped
+      // that state microseconds after sending it, so a lost final
+      // flight could never be recovered. See _onHandshakeConfirmed.
       _stream = QuicStream._(this);
       _initSendAllowances();
     }
+  }
+
+  /// RFC 9001 §4.1.2 / §4.9.2: called once the handshake is confirmed
+  /// (client-side: on receiving HANDSHAKE_DONE). Discards Handshake
+  /// keys/loss-detector state and stops arming Handshake-space PTOs,
+  /// now that no more Handshake-level packets can ever be sent or
+  /// need retransmitting.
+  void _onHandshakeConfirmed() {
+    if (_handshakeConfirmed) return;
+    _handshakeConfirmed = true;
+    _handshakeSpace.discard();
   }
 
   Future<void> _sendCryptoPackets({
@@ -1126,9 +1164,9 @@ class Connection {
     if (expected == null) return; // never saw a server Initial packet
     if (claimed == null) {
       unawaited(_closeInternal());
-      _handshakeCompleteController.addError(const ConnectionException(
-          'server transport parameters omitted '
-          'initial_source_connection_id (RFC 9000 §7.3)'));
+      _handshakeCompleteController.addError(
+          const ConnectionException('server transport parameters omitted '
+              'initial_source_connection_id (RFC 9000 §7.3)'));
       return;
     }
     if (!_bytesEqual(expected, claimed)) {
@@ -1328,8 +1366,7 @@ class Connection {
     // hold the connection open against the peer's idle timeout
     // (matches agents/quic_conn.go and server/quic_visitor.go's shared
     // 10s KeepAlivePeriod).
-    _pingTimer = Timer.periodic(
-        const Duration(seconds: 10),
+    _pingTimer = Timer.periodic(const Duration(seconds: 10),
         (_) => _guardLocalSend('keepalive ping', _sendPing));
   }
 
@@ -1500,7 +1537,7 @@ class Connection {
         earliestPto = pto;
       }
     }
-    if (_handshake.isComplete) {
+    if (_handshakeConfirmed) {
       final pto = _oneRttSpace.lossDetector.ptoDeadline(oneRttMaxAckDelay);
       if (pto != null && (earliestPto == null || pto.isBefore(earliestPto))) {
         earliestPto = pto;
@@ -1571,7 +1608,7 @@ class Connection {
           _handshakeSpace, LongPacketType.handshake);
       return;
     }
-    if (_handshake.isComplete && _oneRttSpace.keys.hasKeys) {
+    if (_handshakeConfirmed && _oneRttSpace.keys.hasKeys) {
       await _sendPing();
     }
   }

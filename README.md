@@ -355,6 +355,52 @@ final streamCount = await connection.streamCount;
 
 ---
 
+## 🩹 Reliability Fixes (`dart_quic` — pure-Dart client, `feature/dart` branch)
+
+`dart_quic/` (this repo's `feature/dart` branch) is a separate, pure-Dart
+QUIC v1 client — no FFI, no Rust toolchain — built specifically for
+[commander](https://github.com/LeafAI/Leaf)'s low-bandwidth chat/control
+link. See `dart_quic/DESIGN.md` for its scope and architecture.
+
+### Fixed: connections could stall permanently on ordinary packet loss
+
+**Symptom**: both first-time connect and automatic reconnect could hang
+indefinitely (client kept sending bare PINGs, server never responded
+again) whenever the client's final handshake flight — or any packet
+right around handshake completion — was lost in transit. Reproduced
+deterministically by dropping 3 consecutive client→server packets right
+at that point in the handshake.
+
+**Root cause**: RFC 9001 §4.9.2 says Handshake-space keys and loss-
+detector state must be discarded once the handshake is *confirmed* —
+and per §4.1.2, a **client** only considers the handshake confirmed
+once it receives a `HANDSHAKE_DONE` frame from the server. The client
+was instead discarding that state as soon as it locally finished
+computing its own TLS Finished message (`_handshake.isComplete`) —
+which happens moments *after* sending its last Handshake-space flight
+(Certificate/CertificateVerify/Finished), but well *before* the server
+could possibly have ACKed it. Discarding the loss-detector's
+retransmission bookkeeping at that point meant: if any packet in that
+final flight was lost, it could never be retransmitted — the
+connection stalled forever, since the client had nothing left to
+retry with.
+
+The same wrong condition (`_handshake.isComplete` instead of true
+handshake confirmation) had also leaked into the 1-RTT PTO arming logic
+and the loss detector's RTT-sampling gate, both of which RFC 9000/9002
+explicitly scope to "handshake confirmed," not "handshake complete."
+
+**Fix**: introduced an explicit `_handshakeConfirmed` flag, set only
+when a `HandshakeDoneFrame` is processed (previously decoded but never
+acted on). Handshake-space discard and every other confirmation-gated
+check now key off this flag instead of local TLS completion.
+
+Fixed in `dart_quic` commit
+[`31ce898`](https://github.com/Worthies/quic4d/commit/31ce898a892e672c874eb1aee50c2d7c62851567),
+picked up by commander via its pinned `dart_quic` git dependency.
+
+---
+
 ## ❌ Current Limitations
 
 - ❌ **WebTransport** - Web platform not supported (Quinn is native only)

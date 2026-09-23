@@ -187,11 +187,14 @@ class QuicConnection {
 
   impl.ConnectionState get state => _connection.state;
 
-  /// Opens (or returns the already-open) bidirectional stream --
-  /// DESIGN.md's single-stream model means this is idempotent rather
-  /// than opening a new stream on every call, unlike quic4d's
-  /// `connectionOpenBi` (which really does open a fresh stream each
-  /// time, since Quinn supports many concurrent streams).
+  /// Opens (or returns the already-open) the connection's own control
+  /// bidirectional stream -- DESIGN.md's original single-stream model
+  /// meant this was idempotent (never opened more than one stream);
+  /// multi-stream support (see [openAdditionalBi]) preserves that
+  /// exact idempotent behavior for this specific method so every
+  /// existing call site (commander's own quic_client.dart) needs no
+  /// changes at all -- `openBi()` always means "the one control
+  /// stream," never "open a fresh one."
   Future<(QuicSendStream, QuicRecvStream)> openBi() async {
     final existingSend = _sendStream;
     final existingRecv = _recvStream;
@@ -204,6 +207,26 @@ class QuicConnection {
     _sendStream = send;
     _recvStream = recv;
     return (send, recv);
+  }
+
+  /// Opens a genuinely NEW, independent bidirectional stream on this
+  /// same connection, distinct from [openBi]'s own always-the-same-
+  /// stream control channel -- see leaf's PLAN.md "Remote VNC
+  /// Forwarding" section, Correction #2 for the motivating use case
+  /// (a dedicated stream for VNC frame-buffer bytes, separate from the
+  /// ordinary JSON control channel [openBi] carries). Unlike [openBi],
+  /// every call opens another new stream; the caller is responsible
+  /// for keeping track of the returned pair itself (there is no cached
+  /// "the additional stream" the way [openBi] caches its own single
+  /// one, since there can be more than one).
+  ///
+  /// Throws [impl.ConnectionException] (via
+  /// [impl.Connection.openAdditionalStream]) if the handshake hasn't
+  /// completed yet, or if opening another stream would exceed the
+  /// server's own advertised concurrent-stream limit.
+  (QuicSendStream, QuicRecvStream) openAdditionalBi() {
+    final stream = _connection.openAdditionalStream();
+    return (QuicSendStream._(stream), QuicRecvStream._(stream));
   }
 
   Stream<void> get onClosed => _connection.onClosed;

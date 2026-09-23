@@ -34,19 +34,33 @@ import (
 // commander's QuicClient e2e test, which keys its connected/visitorName
 // state off that message. dart_quic's own tests do not pass this flag
 // (they assert the FIRST received chunk is their echo).
+//
+// Optional "-multi" flag: after accepting the client's first (control)
+// stream, also accepts a SECOND bidirectional stream and, mirroring
+// leaf server/vnc_relay.go's own real wire contract (see that file's
+// own doc comment), reads a single tag line off it ("STREAM2 <rest>\n")
+// and echoes the *rest* of that line back verbatim on the same stream
+// -- proving a real quic-go peer can have two independent streams open
+// on one connection with dart_quic as the client, each carrying its
+// own data with no cross-talk (see multi_stream_test.dart, the actual
+// consumer of this flag).
 func main() {
 	certDir := os.Args[1]
 	addr := os.Args[2]
 	maxMessages := -1 // unlimited -- read until the client closes the stream
-	if len(os.Args) > 3 && os.Args[3] != "-welcome" {
+	if len(os.Args) > 3 && os.Args[3] != "-welcome" && os.Args[3] != "-multi" {
 		if n, err := fmt.Sscanf(os.Args[3], "%d", &maxMessages); err != nil || n != 1 {
 			log.Fatalf("invalid max-messages argument: %v", os.Args[3])
 		}
 	}
 	sendWelcome := false
+	acceptSecondStream := false
 	for _, arg := range os.Args[3:] {
 		if arg == "-welcome" {
 			sendWelcome = true
+		}
+		if arg == "-multi" {
+			acceptSecondStream = true
 		}
 	}
 
@@ -93,6 +107,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("accept stream: %v", err)
 	}
+
+	if acceptSecondStream {
+		go handleSecondStream(conn)
+	}
+
 
 	if sendWelcome {
 		welcome := `{"type":"welcome","visitor_name":"e2e-test-user","visitors":[]}` + "\n"
@@ -143,4 +162,43 @@ func main() {
 	time.Sleep(200 * time.Millisecond)
 	stream.Close()
 	conn.CloseWithError(0, "done")
+}
+
+// handleSecondStream accepts exactly one additional bidirectional
+// stream beyond the connection's own control stream, reads a single
+// "STREAM2 <rest>\n" tag line off it (mirroring leaf server/
+// vnc_relay.go's real "VNCSTREAM <reqID>\n" tag-line wire contract --
+// see that file's own doc comment), and echoes back everything after
+// the "STREAM2 " prefix verbatim. Used only by "-multi" mode (see
+// main's own doc comment) to prove a real quic-go server sees two
+// genuinely independent streams from a dart_quic client with no
+// cross-talk between them.
+func handleSecondStream(conn *quic.Conn) {
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("second stream: accept failed: %v", err)
+		return
+	}
+	reader := bufio.NewReader(stream)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		log.Printf("second stream: read failed: %v", err)
+		return
+	}
+	log.Printf("second stream: received: %q", line)
+	const prefix = "STREAM2 "
+	trimmed := strings.TrimSuffix(line, "\n")
+	var reply string
+	if strings.HasPrefix(trimmed, prefix) {
+		reply = strings.TrimPrefix(trimmed, prefix) + "\n"
+	} else {
+		reply = "unrecognized-tag\n"
+	}
+	if _, err := stream.Write([]byte(reply)); err != nil {
+		log.Printf("second stream: write failed: %v", err)
+		return
+	}
+	log.Printf("second stream: sent: %q", reply)
+	time.Sleep(200 * time.Millisecond)
+	stream.Close()
 }

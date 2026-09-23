@@ -30,6 +30,7 @@ import 'recovery/congestion_control.dart';
 import 'recovery/loss_detection.dart' show LostPacket;
 import 'recovery/rtt_estimator.dart';
 import 'recovery/sent_packet.dart';
+import 'stream_id_allocator.dart';
 import 'tls/transport_parameters.dart';
 
 class ConnectionException implements Exception {
@@ -157,9 +158,25 @@ class StreamReassembler {
 /// stream model. Always stream ID 0 (the first client-initiated
 /// bidirectional stream ID per RFC 9000 §2.1's numbering scheme).
 class QuicStream {
+  /// The control stream's own fixed ID (the first client-initiated
+  /// bidirectional stream, per RFC 9000 §2.1 -- every non-VNC call
+  /// site keeps using this exact stream, unchanged from before
+  /// multi-stream support existed). Every OTHER stream a [Connection]
+  /// opens (see [Connection.openAdditionalStream]) gets its own,
+  /// distinct ID from the same RFC 9000 §2.1 sequence (4, 8, 12, ...)
+  /// -- see [streamId].
   static const int clientBidiStreamId0 = 0;
 
   final Connection _connection;
+
+  /// This stream's own ID on the wire (RFC 9000 §2.1) -- `0` for the
+  /// connection's own control stream, `4`/`8`/`12`/... for every
+  /// additional stream opened via [Connection.openAdditionalStream].
+  /// Frames are routed to the correct [QuicStream] instance by this ID
+  /// (see [Connection._processFrames]'s STREAM-frame handling), and
+  /// every outgoing STREAM frame this stream sends carries it too.
+  final int streamId;
+
   // Broadcast semantics are kept (multiple listeners allowed, late
   // subscribers see only future data), but a broadcast StreamController
   // DROPS events added while nobody is listening. That is wrong for
@@ -176,7 +193,20 @@ class QuicStream {
   int _sendOffset = 0;
   late final StreamReassembler _reassembler = StreamReassembler(_deliver);
 
-  QuicStream._(this._connection) {
+  // ---- Per-stream flow control (RFC 9000 §4.1's per-stream limits,
+  // distinct from Connection's own connection-wide limits) ----
+  // Mirrors Connection's own _streamReceiveLimit/_maxStreamEndOffset/
+  // _streamSendAllowance/_streamBytesSent fields exactly, but scoped
+  // to this one stream now that more than one can exist -- a VNC
+  // FramebufferUpdate on one stream must not be throttled by (or
+  // silently share/steal) the JSON control stream's own separate
+  // window, and vice versa.
+  int _receiveLimit = 10 * 1024 * 1024;
+  int _maxReceivedEndOffset = 0;
+  int _sendAllowance = 0;
+  int _bytesSent = 0;
+
+  QuicStream._(this._connection, this.streamId) {
     _incomingController = StreamController<Uint8List>.broadcast(
       onListen: _replayParkedChunks,
     );
@@ -226,7 +256,7 @@ class QuicStream {
           ? pos + kMaxStreamFrameChunkSize
           : data.length;
       final chunk = Uint8List.sublistView(data, pos, end);
-      await _connection._sendStreamData(chunk);
+      await _connection._sendStreamData(this, chunk);
       pos = end;
     }
   }
@@ -237,6 +267,7 @@ class QuicStream {
 
   Future<void> close() async {
     await _incomingController.close();
+    _connection._unregisterStream(this);
   }
 }
 
@@ -282,41 +313,64 @@ class Connection {
   final CongestionController _congestion = CongestionController();
 
   // ---- Receive-side flow control (RFC 9000 §4) ----
-  // The limits we advertised in our transport parameters. Once the
-  // peer has sent half the current limit, [_onStreamBytesReceived]
-  // raises it and queues MAX_DATA/MAX_STREAM_DATA frames onto the next
-  // ACK. Without these updates the peer is flow-control BLOCKED
-  // forever once it has sent the initial 10 MiB -- observed live as
-  // "connection goes silent, commander's 45s watchdog reconnects",
-  // with every reconnect's history sync burning through the fresh
-  // window faster and disconnects getting more frequent.
+  // The connection-wide limit we advertised in our transport
+  // parameters. Once the peer has sent half the current limit,
+  // [_onStreamBytesReceived] raises it and queues a MAX_DATA frame
+  // onto the next ACK. Without these updates the peer is flow-control
+  // BLOCKED forever once it has sent the initial 10 MiB -- observed
+  // live as "connection goes silent, commander's 45s watchdog
+  // reconnects", with every reconnect's history sync burning through
+  // the fresh window faster and disconnects getting more frequent.
+  // Per-STREAM receive limits (as opposed to this connection-wide
+  // one) now live on [QuicStream] itself (see its own
+  // _receiveLimit/_maxReceivedEndOffset fields) now that more than
+  // one stream can exist -- each stream's own window is independent,
+  // matching RFC 9000 §4.1's actual per-stream-vs-connection-wide
+  // distinction, which the single-stream design's shared connection-
+  // level fields for both used to obscure (harmlessly, since there
+  // was only ever one stream to conflate them with).
   int _connectionReceiveLimit = 10 * 1024 * 1024;
   int _connectionBytesReceived = 0;
-  int _streamReceiveLimit = 10 * 1024 * 1024;
-  int _maxStreamEndOffset = 0;
 
   // ---- Send-side flow control (RFC 9000 §4) ----
-  // How much this endpoint may still send, per the peer's advertised
-  // initial limits (parsed from the server's transport parameters --
-  // previously never parsed at all, so sends beyond the server's
-  // initial window worked only by luck of the server's reader keeping
-  // up) plus any MAX_DATA/MAX_STREAM_DATA updates it sends while the
-  // connection is live. Writes beyond the allowance queue in
-  // [_pendingSends] until the peer opens the window.
+  // How much this endpoint may still send connection-wide, per the
+  // peer's advertised initial limits (parsed from the server's
+  // transport parameters -- previously never parsed at all, so sends
+  // beyond the server's initial window worked only by luck of the
+  // server's reader keeping up) plus any MAX_DATA updates it sends
+  // while the connection is live. Per-stream send allowances (as
+  // opposed to this connection-wide one) now live on [QuicStream]
+  // itself (see its own _sendAllowance/_bytesSent fields). Writes
+  // beyond either allowance queue in [_pendingSends] until the peer
+  // opens the relevant window(s).
   int _connectionSendAllowance = 0;
-  int _streamSendAllowance = 0;
-  final List<Uint8List> _pendingSends = [];
+  final List<(QuicStream, Uint8List)> _pendingSends = [];
 
-  /// Total stream payload bytes this endpoint has SENT (1-RTT), for
-  /// converting the peer's absolute MAX_DATA/MAX_STREAM_DATA offsets
-  /// into remaining allowances.
+  /// Total stream payload bytes this endpoint has SENT (1-RTT) across
+  /// EVERY stream combined, for converting the peer's absolute
+  /// MAX_DATA offset into the remaining connection-wide allowance.
   int _connectionBytesSent = 0;
-  int _streamBytesSent = 0;
 
   /// Window-update frames queued for the next outbound packet, set by
   /// [_onStreamBytesReceived] and consumed by
   /// [_takePendingFlowControlFrames].
   final List<Frame> _pendingFlowControlFrames = [];
+
+  /// Allocates this connection's own client-initiated-bidirectional
+  /// stream IDs (RFC 9000 §2.1: 0, 4, 8, ...) -- see
+  /// [openAdditionalStream].
+  final ClientBidiStreamIdAllocator _streamIdAllocator =
+      ClientBidiStreamIdAllocator();
+
+  /// The maximum number of concurrent bidirectional streams the SERVER
+  /// permits this client to have open, from its own
+  /// initial_max_streams_bidi transport parameter (RFC 9000 §4.6/
+  /// §18.2) -- defaults to 1 (just the control stream) until the
+  /// server's real value is parsed in [_initSendAllowances], matching
+  /// "assume the most restrictive limit until told otherwise" rather
+  /// than optimistically allowing opens that might violate the peer's
+  /// own advertised limit.
+  int _peerMaxStreamsBidi = 1;
 
   ConnectionState state = ConnectionState.connecting;
 
@@ -326,7 +380,14 @@ class Connection {
   /// the initial_source_connection_id the server later declares in its
   /// transport parameters.
   Uint8List? _serverFirstInitialScid;
-  QuicStream? _stream;
+
+  /// Every currently-open stream, keyed by its own wire stream ID (see
+  /// [QuicStream.streamId]) -- the control stream (ID 0) plus any
+  /// additional streams opened via [openAdditionalStream]. Incoming
+  /// STREAM frames are routed by looking up their own streamId here
+  /// (see [_processFrames]) instead of assuming there is only one
+  /// possible destination.
+  final Map<int, QuicStream> _streams = {};
   Timer? _pingTimer;
   Timer? _lossDetectionTimer;
   Timer? _idleTimeoutTimer;
@@ -780,19 +841,31 @@ class Connection {
         acknowledgedPns.addAll(frame.acknowledgedPacketNumbers());
         latestAckDelayMicros = frame.ackDelay * ackDelayShift;
       } else if (frame is StreamFrame) {
-        _onStreamBytesReceived(frame);
-        // Frames for any stream other than our single bidi stream 0
-        // (a server-initiated stream we never opened) must not
-        // corrupt stream 0's reassembly -- drop them for this
-        // scope (DESIGN.md: exactly one stream, ever).
-        if (frame.streamId == QuicStream.clientBidiStreamId0) {
-          _stream?._handleFrame(frame);
-        }
+        // Routed by the frame's own streamId -- see _streams' own doc
+        // comment. A frame for a stream ID this connection doesn't
+        // recognize (never opened by us, since dart_quic is
+        // client-only per DESIGN.md -- there is no server-initiated
+        // stream case to handle) is dropped rather than corrupting
+        // some other stream's reassembly.
+        final targetStream = _streams[frame.streamId];
+        _onStreamBytesReceived(frame, targetStream);
+        targetStream?._handleFrame(frame);
       } else if (frame is MaxDataFrame) {
         _connectionSendAllowance = frame.maximumData - _connectionBytesSent;
       } else if (frame is MaxStreamDataFrame) {
-        if (frame.streamId == QuicStream.clientBidiStreamId0) {
-          _streamSendAllowance = frame.maximumStreamData - _streamBytesSent;
+        final targetStream = _streams[frame.streamId];
+        if (targetStream != null) {
+          targetStream._sendAllowance =
+              frame.maximumStreamData - targetStream._bytesSent;
+        }
+      } else if (frame is MaxStreamsFrame) {
+        // RFC 9000 §19.11: raises the limit on how many concurrent
+        // bidirectional streams THIS client may have open -- only
+        // meaningful once it exceeds the value _initSendAllowances
+        // parsed from the server's initial transport parameters (a
+        // server is free to raise it later; it is never lowered).
+        if (frame.bidirectional && frame.maximumStreams > _peerMaxStreamsBidi) {
+          _peerMaxStreamsBidi = frame.maximumStreams;
         }
       } else if (frame is ConnectionCloseFrame) {
         QuicDiagnostics.report(
@@ -859,7 +932,7 @@ class Connection {
     if (_handshake.isComplete && !_handshakeCompleteController.isClosed) {
       if (!_oneRttSpace.keys.hasKeys) {
         await _oneRttSpace.installKeys(_handshake.applicationTrafficSecrets);
-        _stream = QuicStream._(this);
+        _createControlStream();
         _initSendAllowances();
       }
       _handshakeCompleteController.add(null);
@@ -1012,9 +1085,28 @@ class Connection {
       // must remain retransmittable if lost; discarding here wiped
       // that state microseconds after sending it, so a lost final
       // flight could never be recovered. See _onHandshakeConfirmed.
-      _stream = QuicStream._(this);
+      _createControlStream();
       _initSendAllowances();
     }
+  }
+
+  /// Creates and registers the connection's own control stream (ID 0)
+  /// -- called from both places 1-RTT keys can first become available
+  /// (whichever of [_processFrames]/[_flushHandshakeOutbound] runs
+  /// first creates it; the other's own `!_oneRttSpace.keys.hasKeys`
+  /// guard means it never runs twice). Consumes the stream ID
+  /// allocator's own first allocation (always 0, per RFC 9000 §2.1 --
+  /// see [ClientBidiStreamIdAllocator]) so every later
+  /// [openAdditionalStream] call continues the sequence from 4.
+  void _createControlStream() {
+    final id = _streamIdAllocator.allocate();
+    assert(id == QuicStream.clientBidiStreamId0);
+    final stream = QuicStream._(this, id);
+    _streams[id] = stream;
+  }
+
+  void _unregisterStream(QuicStream stream) {
+    _streams.remove(stream.streamId);
   }
 
   /// RFC 9001 §4.1.2 / §4.9.2: called once the handshake is confirmed
@@ -1087,7 +1179,7 @@ class Connection {
     return padded;
   }
 
-  Future<void> _sendStreamData(Uint8List data) async {
+  Future<void> _sendStreamData(QuicStream stream, Uint8List data) async {
     if (!_oneRttSpace.keys.hasKeys) {
       throw const ConnectionException(
           'cannot send stream data before the handshake completes');
@@ -1098,9 +1190,16 @@ class Connection {
     // don't fit the current allowance queue until the peer's
     // MAX_DATA/MAX_STREAM_DATA opens the window (handled in
     // _processFrames, which flushes via _flushPendingSends).
-    _pendingSends.add(data);
+    _pendingSends.add((stream, data));
     await _flushPendingSends();
   }
+
+  /// Every stream's own initial send allowance, so a stream opened
+  /// later via [openAdditionalStream] (after [_initSendAllowances] has
+  /// already run once for the control stream) gets the same server-
+  /// advertised starting window the control stream did -- see
+  /// [_createControlStream]/[openAdditionalStream]'s own call sites.
+  int _initialStreamSendAllowance = 0x3FFFFFFFFFFFFFFF;
 
   /// Initial send allowances from the server's transport parameters.
   /// Called once the handshake completes (the parameters live in the
@@ -1113,7 +1212,12 @@ class Connection {
   /// tolerated -- see ClientHandshake._parseEncryptedExtensions) leaves
   /// the allowances unlimited rather than zero: deadlocking all sends
   /// forever would be strictly worse than the pre-flow-control
-  /// behavior of trusting the peer's reader to keep up.
+  /// behavior of trusting the peer's reader to keep up. The same
+  /// applies to initial_max_streams_bidi: an omitted/non-conforming
+  /// server leaves [_peerMaxStreamsBidi] at its already-generous
+  /// unlimited-ish default rather than the conservative 1-stream
+  /// fallback [_peerMaxStreamsBidi]'s own field doc describes for the
+  /// pre-handshake-complete window.
   bool _sendAllowancesInitialized = false;
   void _initSendAllowances() {
     if (_sendAllowancesInitialized) return;
@@ -1121,15 +1225,29 @@ class Connection {
     final server = _handshake.serverTransportParameters;
     if (server == null) {
       _connectionSendAllowance = 0x3FFFFFFFFFFFFFFF;
-      _streamSendAllowance = 0x3FFFFFFFFFFFFFFF;
+      _initialStreamSendAllowance = 0x3FFFFFFFFFFFFFFF;
+      _peerMaxStreamsBidi = 0x3FFFFFFFFFFFFFFF;
+      _streams[QuicStream.clientBidiStreamId0]?._sendAllowance =
+          _initialStreamSendAllowance;
       return;
     }
     _connectionSendAllowance = server.initialMaxData;
     // For a client-initiated bidi stream, the limit that applies to
     // OUR sends is the server's initial_max_stream_data_bidi_remote
     // (how much the REMOTE endpoint allows on streams it didn't
-    // initiate) -- RFC 9000 §18.2's table.
-    _streamSendAllowance = server.initialMaxStreamDataBidiRemote;
+    // initiate) -- RFC 9000 §18.2's table. Recorded so every
+    // subsequently-opened stream (not just the control stream created
+    // moments before this runs) starts with the same server-advertised
+    // window.
+    _initialStreamSendAllowance = server.initialMaxStreamDataBidiRemote;
+    _streams[QuicStream.clientBidiStreamId0]?._sendAllowance =
+        _initialStreamSendAllowance;
+    // How many concurrent bidi streams the server permits THIS client
+    // to have open (RFC 9000 §4.6) -- see [_peerMaxStreamsBidi]'s own
+    // doc comment and [openAdditionalStream]'s own limit check.
+    if (server.initialMaxStreamsBidi > 0) {
+      _peerMaxStreamsBidi = server.initialMaxStreamsBidi;
+    }
     // RTT accounting inputs (RFC 9000 §18.2): the peer's ACK delay
     // scaling and its declared max ACK delay.
     _ackDelayExponentShift = 1 << server.ackDelayExponent;
@@ -1188,20 +1306,34 @@ class Connection {
 
   /// Sends as many queued stream chunks as the current flow-control
   /// allowances, congestion window, and leave queued. Each chunk reuses
-  /// the stream's _sendOffset bookkeeping via _sendStreamChunk, which
-  /// advances it. Flushes are re-triggered whenever an ACK grows the
-  /// congestion window or a MAX_DATA frame grows the flow-control
-  /// allowance (both from _processFrames), and by PTO probes if
-  /// everything in flight was lost (probes themselves bypass this gate
-  /// per RFC 9002 §6.2/A.9, so the loop can never wedge).
+  /// its OWN stream's _sendOffset bookkeeping via _sendStreamChunk,
+  /// which advances it -- now that more than one stream can exist,
+  /// _pendingSends carries each chunk's originating [QuicStream]
+  /// alongside its bytes so the right stream's own offset/allowance is
+  /// what gets consulted and advanced, never conflating two different
+  /// streams' bookkeeping. Flushes are re-triggered whenever an ACK
+  /// grows the congestion window or a MAX_DATA/MAX_STREAM_DATA frame
+  /// grows a flow-control allowance (both from _processFrames), and by
+  /// PTO probes if everything in flight was lost (probes themselves
+  /// bypass this gate per RFC 9002 §6.2/A.9, so the loop can never
+  /// wedge).
+  ///
+  /// Head-of-line note: a chunk blocked on ITS OWN stream's exhausted
+  /// window still blocks every later-queued chunk from a DIFFERENT
+  /// stream behind it in FIFO order (this loop only ever inspects
+  /// `_pendingSends.first`) -- acceptable for this library's actual
+  /// two-stream-at-most usage (see DESIGN.md's Correction #2 update:
+  /// one JSON control stream + one VNC data stream), where cross-
+  /// stream write concurrency isn't a real-world bottleneck, but not a
+  /// general-purpose multiplexer's fair-scheduling guarantee.
   ///
   /// Single-flight: only one loop may run at a time. canSend() reads
   /// bytesInFlight synchronously, but the in-flight counter only grows
   /// after _sendStreamChunk's packet-build await -- without this guard
   /// two interleaved flush loops both pass the gate and overshoot the
-  /// congestion window (same TOCTOU family as the _sendOffset race).
-  /// Re-entrant calls return immediately; the running loop re-reads
-  /// the gates each iteration, so no wakeup is lost.
+  /// congestion window (same TOCTOU family as the per-stream _sendOffset
+  /// race). Re-entrant calls return immediately; the running loop
+  /// re-reads the gates each iteration, so no wakeup is lost.
   bool _flushPendingSendsInFlight = false;
   bool _reportedLateHandshakePackets = false;
   Future<void> _flushPendingSends() async {
@@ -1209,28 +1341,23 @@ class Connection {
     _flushPendingSendsInFlight = true;
     try {
       while (_pendingSends.isNotEmpty) {
-        final next = _pendingSends.first;
-        if (_connectionSendAllowance < next.length ||
-            _streamSendAllowance < next.length) {
+        final (stream, data) = _pendingSends.first;
+        if (_connectionSendAllowance < data.length ||
+            stream._sendAllowance < data.length) {
           return; // flow-control window exhausted; retry on MAX_DATA
         }
-        if (!_congestion.canSend(next.length + 64)) {
+        if (!_congestion.canSend(data.length + 64)) {
           return; // congestion window exhausted; retry on next ACK/PTO
         }
         _pendingSends.removeAt(0);
-        await _sendStreamChunk(next);
+        await _sendStreamChunk(stream, data);
       }
     } finally {
       _flushPendingSendsInFlight = false;
     }
   }
 
-  Future<void> _sendStreamChunk(Uint8List data) async {
-    final stream = _stream;
-    if (stream == null) {
-      throw const ConnectionException(
-          'cannot send stream data before the handshake completes');
-    }
+  Future<void> _sendStreamChunk(QuicStream stream, Uint8List data) async {
     // Read AND advance all bookkeeping synchronously, before the
     // packet-build await below: two flush loops (the app's write()
     // path and _processFrames' flush on an incoming MAX_DATA) can
@@ -1240,11 +1367,11 @@ class Connection {
     final offset = stream._sendOffset;
     stream._sendOffset = offset + data.length;
     _connectionBytesSent += data.length;
-    _streamBytesSent += data.length;
+    stream._bytesSent += data.length;
     _connectionSendAllowance -= data.length;
-    _streamSendAllowance -= data.length;
-    final frame = StreamFrame(
-        streamId: QuicStream.clientBidiStreamId0, offset: offset, data: data);
+    stream._sendAllowance -= data.length;
+    final frame =
+        StreamFrame(streamId: stream.streamId, offset: offset, data: data);
     final packetNumber = _oneRttSpace.allocatePacketNumber();
     final pnLength = packetNumberEncodingLength(
         packetNumber, _oneRttSpace.largestAckedPacket);
@@ -1278,10 +1405,17 @@ class Connection {
   /// keep the window open as data is consumed). Policy: when half the
   /// current limit has been consumed, double it (bounded growth) and
   /// queue window-update frames for the next outbound packet.
-  void _onStreamBytesReceived(StreamFrame frame) {
+  /// [targetStream] is null when [frame] names a stream ID this
+  /// connection doesn't recognize (see [_processFrames]'s own lookup)
+  /// -- the bytes still count against the connection-wide receive
+  /// limit (a peer that sends data on an ID we don't have open has
+  /// still consumed our connection-wide flow-control budget, RFC 9000
+  /// §4.1's connection-level accounting applies regardless of whether
+  /// the specific stream is one we're tracking), but there is no
+  /// per-stream window to raise or MAX_STREAM_DATA to send back for a
+  /// stream this connection never opened.
+  void _onStreamBytesReceived(StreamFrame frame, QuicStream? targetStream) {
     _connectionBytesReceived += frame.data.length;
-    final end = frame.offset + frame.data.length;
-    if (end > _maxStreamEndOffset) _maxStreamEndOffset = end;
 
     var updateNeeded = false;
     if (_connectionBytesReceived >= _connectionReceiveLimit ~/ 2) {
@@ -1290,13 +1424,23 @@ class Connection {
           .add(MaxDataFrame(maximumData: _connectionReceiveLimit));
       updateNeeded = true;
     }
-    if (_maxStreamEndOffset >= _streamReceiveLimit ~/ 2) {
-      _streamReceiveLimit = _maxStreamEndOffset + 10 * 1024 * 1024;
-      _pendingFlowControlFrames.add(MaxStreamDataFrame(
-          streamId: QuicStream.clientBidiStreamId0,
-          maximumStreamData: _streamReceiveLimit));
-      updateNeeded = true;
+
+    if (targetStream != null) {
+      final end = frame.offset + frame.data.length;
+      if (end > targetStream._maxReceivedEndOffset) {
+        targetStream._maxReceivedEndOffset = end;
+      }
+      if (targetStream._maxReceivedEndOffset >=
+          targetStream._receiveLimit ~/ 2) {
+        targetStream._receiveLimit =
+            targetStream._maxReceivedEndOffset + 10 * 1024 * 1024;
+        _pendingFlowControlFrames.add(MaxStreamDataFrame(
+            streamId: targetStream.streamId,
+            maximumStreamData: targetStream._receiveLimit));
+        updateNeeded = true;
+      }
     }
+
     // A window update with no ACK in flight (the peer is blocked, so
     // it has stopped sending, so no new ACK is imminent) still needs
     // to go out -- send a packet now rather than waiting for the next
@@ -1351,14 +1495,53 @@ class Connection {
     socket.send(bytes, address, port);
   }
 
-  /// The single bidirectional stream, once the handshake has completed.
+  /// The connection's own control stream (always stream ID 0, RFC 9000
+  /// §2.1), once the handshake has completed -- every non-VNC call
+  /// site's existing usage of this getter is entirely unchanged by
+  /// multi-stream support.
   QuicStream get stream {
-    final s = _stream;
+    final s = _streams[QuicStream.clientBidiStreamId0];
     if (s == null) {
       throw const ConnectionException(
           'stream is not available before the handshake completes');
     }
     return s;
+  }
+
+  /// Opens a genuinely NEW, independent bidirectional stream on this
+  /// same connection (unlike [stream]/the deprecated single-stream-era
+  /// `openBi()`, which always returns the same cached control stream)
+  /// -- see PLAN.md's "Remote VNC Forwarding" section, Correction #2
+  /// for why this exists: a VNC session's own frame-buffer bytes need
+  /// a dedicated stream separate from the connection's ordinary JSON
+  /// control channel.
+  ///
+  /// Throws [ConnectionException] if the handshake hasn't completed
+  /// yet (mirrring [stream]'s own precondition), or if opening another
+  /// stream would exceed the server's own advertised
+  /// initial_max_streams_bidi limit (RFC 9000 §4.6) -- see
+  /// [_peerMaxStreamsBidi]'s own doc comment. A real quic-go server's
+  /// default limit is generous enough that "connection's one JSON
+  /// stream + one VNC stream" never comes close to it in practice, but
+  /// the check itself must exist rather than just happening to never
+  /// trigger.
+  QuicStream openAdditionalStream() {
+    if (_streams[QuicStream.clientBidiStreamId0] == null) {
+      throw const ConnectionException(
+          'cannot open a stream before the handshake completes');
+    }
+    if (_streams.length >= _peerMaxStreamsBidi) {
+      throw ConnectionException(
+          'opening another stream would exceed the server\'s own '
+          'advertised initial_max_streams_bidi limit ($_peerMaxStreamsBidi '
+          'concurrent bidirectional streams, ${_streams.length} already '
+          'open)');
+    }
+    final id = _streamIdAllocator.allocate();
+    final newStream = QuicStream._(this, id);
+    newStream._sendAllowance = _initialStreamSendAllowance;
+    _streams[id] = newStream;
+    return newStream;
   }
 
   void _startPingTimer() {
@@ -1655,7 +1838,13 @@ class Connection {
     _idleTimeoutTimer?.cancel();
     _lossDetectionTimer?.cancel();
     state = ConnectionState.closed;
-    await _stream?.close();
+    // Close every open stream (the control stream plus any additional
+    // ones opened via openAdditionalStream), not just a single cached
+    // one -- QuicStream.close() itself removes each from _streams as
+    // it closes, so iterate a snapshot rather than the live map.
+    for (final s in List<QuicStream>.from(_streams.values)) {
+      await s.close();
+    }
     _socket?.close();
     if (!_connectionClosedController.isClosed) {
       _connectionClosedController.add(null);

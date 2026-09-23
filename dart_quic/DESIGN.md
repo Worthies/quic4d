@@ -32,14 +32,30 @@ In scope:
   path.
 - ALPN fixed to `"leaf-commander"` (matches `quicNextProto` in
   `agents/quic_conn.go` and `server/quic_visitor.go`).
-- Exactly one client-initiated bidirectional stream per connection,
-  opened immediately after the handshake completes, held open for the
-  connection's lifetime. This is the entire stream model commander uses
-  — no unidirectional streams, no server-initiated streams, no more than
-  one stream at a time.
-- Newline-delimited JSON application framing on that one stream (framing
-  itself is application-layer, not this library's concern, but the
-  library must not reorder/duplicate/corrupt bytes within the stream).
+- One client-initiated bidirectional control stream per connection
+  (stream ID 0, RFC 9000 §2.1), opened immediately after the handshake
+  completes and held open for the connection's lifetime, carrying
+  newline-delimited JSON application framing (framing itself is
+  application-layer, not this library's concern, but the library must
+  not reorder/duplicate/corrupt bytes within the stream) — this remains
+  the primary stream model commander uses for chat/control traffic.
+- **Extended (leaf's "Remote VNC Forwarding" feature, PLAN.md
+  Correction #2): a small number of ADDITIONAL client-initiated
+  bidirectional streams**, opened on demand via
+  `Connection.openAdditionalStream()`/`QuicConnection.openAdditionalBi()`
+  (distinct from `stream`/`openBi()`, which always mean the one control
+  stream and are unaffected by this) — real per-stream-ID routing of
+  incoming STREAM frames, real per-stream flow control
+  (MAX_STREAM_DATA/receive-window tracking independent of the control
+  stream's own), and honoring the peer's own initial_max_streams_bidi
+  limit (RFC 9000 §4.6) rather than assuming it's always 1. Scoped
+  narrowly: this is still not a general-purpose multiplexer (see the
+  head-of-line note on `Connection._flushPendingSends`'s own doc
+  comment — a blocked stream can still hold up a later-queued send on
+  a DIFFERENT stream behind it in FIFO order), just enough to support
+  commander's actual "one JSON control stream + one dedicated VNC data
+  stream" need. No unidirectional streams, no server-initiated streams
+  (dart_quic is still client-role-only).
 - The one non-STREAM behavior commander depends on: writing a
   literal `{"type":"_quic_hello"}\n` "handshake frame" as the first bytes
   on the stream so the server's `AcceptStream` unblocks (a QUIC stream
@@ -65,8 +81,11 @@ appears):
 - 0-RTT / session resumption.
 - Connection migration, NAT rebinding, path validation beyond initial
   handshake's implicit validation.
-- Multiple concurrent streams, unidirectional streams, stream
-  prioritization.
+- Unidirectional streams, stream prioritization, and any general-
+  purpose fair-scheduling guarantee across concurrent streams (see the
+  multi-stream extension above for exactly how far "multiple concurrent
+  streams" was actually taken, and its own explicitly-accepted
+  head-of-line limitation).
 - QUIC datagrams (RFC 9221).
 - HTTP/3, WebTransport — this is a raw QUIC transport client, not an H3
   stack.

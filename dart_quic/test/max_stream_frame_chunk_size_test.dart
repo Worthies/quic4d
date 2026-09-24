@@ -15,6 +15,17 @@ import 'package:test/test.dart';
 /// constant was raised above what one such real VPN path's own actual
 /// MTU allowed.
 ///
+/// NOTE: this constant is now only the pre-discovery/never-confirmed
+/// FALLBACK -- real Path MTU Discovery (see
+/// lib/src/recovery/mtu_discovery.dart, exercised end-to-end in
+/// test/integration/mtu_discovery_e2e_test.dart) lets
+/// Connection._streamChunkSize grow past this once a larger size is
+/// actually confirmed safe for a specific connection's own path. This
+/// constant's own safety property still matters, though: it's what
+/// every write() uses from connect() until discovery confirms
+/// something larger, so it must stay unconditionally safe on its own,
+/// with no dependency on discovery having run yet.
+///
 /// This test can't reproduce the network-drop behavior itself (that
 /// needs a real constrained-MTU path, which integration tests in this
 /// package already exercise against a real quic-go server over

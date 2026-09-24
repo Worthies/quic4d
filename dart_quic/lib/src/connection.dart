@@ -28,6 +28,7 @@ import 'packet/packet_number_space.dart';
 import 'packet/protection.dart' show PacketProtectionException;
 import 'recovery/congestion_control.dart';
 import 'recovery/loss_detection.dart' show LostPacket;
+import 'recovery/mtu_discovery.dart';
 import 'recovery/rtt_estimator.dart';
 import 'recovery/sent_packet.dart';
 import 'stream_id_allocator.dart';
@@ -45,51 +46,56 @@ class ConnectionException implements Exception {
 /// expand every Initial-packet-carrying datagram to.
 const int kMinimumInitialDatagramSize = 1200;
 
-/// Largest STREAM-frame payload [QuicStream.write] will place in a
-/// single 1-RTT packet. RFC 9000 places no protocol-level limit on a
-/// STREAM frame's data length short of the packet it travels in, but
-/// nothing in this library (or the UDP layer beneath it) fragments an
-/// oversized packet -- a single write() call used to build ONE packet
-/// containing the ENTIRE payload, however large. That is invisible for
-/// short chat messages but breaks completely for anything past roughly
-/// a kilobyte: real quic-go peers silently ignore packets whose UDP
+/// Fallback (pre-MTU-discovery, or if discovery never confirms
+/// anything larger) STREAM-frame chunk size -- see
+/// [Connection._streamChunkSize] for the actual value
+/// [QuicStream.write] uses, which grows past this once [MtuDiscoverer]
+/// confirms a larger size actually works on this connection's own
+/// path. RFC 9000 places no protocol-level limit on a STREAM frame's
+/// data length short of the packet it travels in, but nothing in this
+/// library (or the UDP layer beneath it) fragments an oversized packet
+/// -- a single write() call used to build ONE packet containing the
+/// ENTIRE payload, however large. That is invisible for short chat
+/// messages but breaks completely for anything past roughly a
+/// kilobyte: real quic-go peers silently ignore packets whose UDP
 /// datagram exceeds the negotiated max_udp_payload_size, and a payload
 /// anywhere near 64KB blows straight through the OS's own UDP
 /// `sendto()` limit (`EMSGSIZE`) before even reaching the network --
 /// both reproduced live against server/quic_visitor.go's real
 /// quic-go-based server (see test/integration/large_write_test.dart).
-/// [write] instead splits [data] into chunks of at most this many
-/// bytes, one STREAM frame/packet per chunk, matching how every real
-/// QUIC stack paces stream data across multiple packets.
 ///
-/// CORRECTION: this was briefly raised to 1350 (see git history) to
-/// cut Remote VNC Forwarding's own per-chunk AEAD/send overhead for a
+/// This value alone (matching [kMinimumInitialDatagramSize] minus
+/// packet overhead) is exactly RFC 9000 §14.1's own unconditionally-
+/// guaranteed floor: safe on literally any compliant QUIC path with
+/// zero discovery needed, which is why it's what every write() uses
+/// before [MtuDiscoverer] has confirmed anything larger.
+///
+/// HISTORY: this was briefly raised to 1350 (see git history) to cut
+/// Remote VNC Forwarding's own per-chunk AEAD/send overhead for a
 /// large FramebufferUpdate payload (dart_quic's own AEAD is pure-Dart,
 /// not hardware/FFI-accelerated -- see protection.dart's own doc
 /// comment), reasoning that 1350 left headroom under a conservative
-/// 1400-byte "safe MTU" assumption. That assumption was WRONG: this
-/// library implements no Path MTU Discovery at all, so it has no way
-/// to actually learn a path's real MTU, and 1400 bytes is well above
-/// what many real-world tunneled paths (VPNs, corporate proxies,
-/// nested tunnels -- WireGuard commonly ~1420, OpenVPN commonly
-/// ~1350-1400, some nested/multi-hop tunnels well under that) actually
-/// carry without silently dropping the oversized datagram outright --
-/// reproduced live as a real regression: Remote VNC Forwarding's own
-/// low-bandwidth mode (which sends the largest, most tightly-packed
-/// STREAM-frame chunks, since ZRLE compresses a whole frame into one
-/// write() call this constant then slices maximally) went from
-/// "connects" to "connects, then hangs forever and times out" the
-/// moment this constant crossed a real VPN path's own actual MTU --
-/// every maximally-sized packet silently vanished into the tunnel,
-/// and QUIC's own retransmission (which resends the SAME size) could
-/// never recover. Reverted to 1000, matching this library's own
-/// original, proven-safe value -- still comfortably under
-/// [kMinimumInitialDatagramSize] (the one path-MTU floor RFC 9000
-/// §14.1 obligates every compliant QUIC path to support without any
-/// discovery/negotiation), unlike 1350, which was never actually
-/// guaranteed by anything. Revisit only alongside real Path MTU
-/// Discovery (RFC 8899) support, which alone can safely learn whether
-/// a *specific* path tolerates a larger size instead of guessing.
+/// 1400-byte "safe MTU" assumption. That assumption was WRONG: with no
+/// Path MTU Discovery at the time, there was no way to actually learn
+/// a path's real MTU, and 1400 bytes is well above what many real-
+/// world tunneled paths (VPNs, corporate proxies, nested tunnels --
+/// WireGuard commonly ~1420, OpenVPN commonly ~1350-1400, some nested/
+/// multi-hop tunnels well under that) actually carry without silently
+/// dropping the oversized datagram outright -- reproduced live as a
+/// real regression: Remote VNC Forwarding's own low-bandwidth mode
+/// (which sends the largest, most tightly-packed STREAM-frame chunks,
+/// since ZRLE compresses a whole frame into one write() call this
+/// constant then slices maximally) went from "connects" to "connects,
+/// then hangs forever and times out" the moment the fixed chunk size
+/// crossed a real VPN path's own actual MTU -- every maximally-sized
+/// packet silently vanished into the tunnel, and QUIC's own
+/// retransmission (which resends the SAME size) could never recover.
+/// Fixed for real by implementing actual Path MTU Discovery (RFC 8899
+/// -- see [MtuDiscoverer]) instead of assuming any single fixed
+/// number: [Connection._streamChunkSize] now only ever uses a size
+/// this connection's own path has *actually confirmed* it tolerates,
+/// discovered via real ACKed/lost PING probes sent on this same
+/// connection, never a guess.
 const int kMaxStreamFrameChunkSize = 1000;
 
 enum ConnectionState { connecting, handshaking, connected, closed }
@@ -265,21 +271,25 @@ class QuicStream {
 
   /// Sends [data] on this stream, transparently splitting it across
   /// multiple STREAM frames/packets of at most
-  /// [kMaxStreamFrameChunkSize] bytes each -- see that constant's doc
-  /// for why a single write() call used to silently fail for anything
-  /// much bigger than a short chat message. Each chunk carries its own
-  /// correct offset ([_sendOffset] is advanced by the connection layer
-  /// as each chunk is actually transmitted, honoring send-side flow
-  /// control -- chunks may queue until the peer opens its window), so
-  /// the receiver's existing offset-based reassembly
-  /// ([_handleFrame]/[_drainOutOfOrder]) needs no changes.
+  /// [Connection._streamChunkSize] bytes each -- starts at
+  /// [kMaxStreamFrameChunkSize] (RFC 9000's own unconditionally-safe
+  /// floor) and grows, per connection, as [MtuDiscoverer] actually
+  /// confirms a larger size works on this specific path (see that
+  /// class's own doc comment, and [kMaxStreamFrameChunkSize]'s own doc
+  /// comment for why a single fixed larger number was tried and
+  /// reverted before this). Each chunk carries its own correct offset
+  /// ([_sendOffset] is advanced by the connection layer as each chunk
+  /// is actually transmitted, honoring send-side flow control -- chunks
+  /// may queue until the peer opens its window), so the receiver's
+  /// existing offset-based reassembly ([_handleFrame]/
+  /// [_drainOutOfOrder]) needs no changes.
   Future<void> write(Uint8List data) async {
     if (data.isEmpty) return;
     var pos = 0;
     while (pos < data.length) {
-      final end = (pos + kMaxStreamFrameChunkSize < data.length)
-          ? pos + kMaxStreamFrameChunkSize
-          : data.length;
+      final chunkSize = _connection._streamChunkSize;
+      final end =
+          (pos + chunkSize < data.length) ? pos + chunkSize : data.length;
       final chunk = Uint8List.sublistView(data, pos, end);
       await _connection._sendStreamData(this, chunk);
       pos = end;
@@ -336,6 +346,70 @@ class Connection {
   late final PacketNumberSpace _handshakeSpace;
   late final PacketNumberSpace _oneRttSpace;
   late final CongestionController _congestion;
+
+  /// RFC 8899 Path MTU Discovery -- see [MtuDiscoverer]'s own doc
+  /// comment for the full rationale (this connection's own path MTU is
+  /// discovered empirically via real probes, never assumed from a
+  /// single fixed constant). [_streamChunkSize] is what
+  /// [QuicStream.write] actually uses.
+  final MtuDiscoverer _mtuDiscoverer = MtuDiscoverer();
+
+  /// Maps an in-flight MTU probe's own 1-RTT packet number to the
+  /// probe size it was sent at, so [_processFrames]'s own ACK handling
+  /// and [_retransmitLostPackets]'s own loss handling (neither of
+  /// which otherwise has any reason to know about MTU probes -- they
+  /// only see [SentPacket]/[LostPacket]) can report the right outcome
+  /// back to [_mtuDiscoverer] once a probe's fate is known. A probe
+  /// carries no retransmittable frames of its own (see
+  /// [_sendMtuProbe]'s own doc comment on why a lost probe must NOT be
+  /// retransmitted the ordinary way), so this is the only way to
+  /// connect a probe's packet number back to [MtuDiscoverer] at all.
+  final Map<int, int> _inFlightMtuProbes = {};
+
+  /// The size (in bytes) [QuicStream.write] currently splits data
+  /// into -- [kMaxStreamFrameChunkSize] (RFC 9000's own guaranteed-
+  /// safe floor) until [_mtuDiscoverer] actually confirms a larger
+  /// size works on this connection's own path, after which it tracks
+  /// [MtuDiscoverer.currentMtu] (minus this connection's own worst-
+  /// case per-packet overhead, so the confirmed UDP payload size never
+  /// gets exceeded once STREAM-frame/short-header/AEAD-tag overhead is
+  /// added back on top of the chunk itself).
+  int get _streamChunkSize {
+    final confirmed = _mtuDiscoverer.currentMtu - _mtuProbeOverheadBytes;
+    return confirmed > kMaxStreamFrameChunkSize
+        ? confirmed
+        : kMaxStreamFrameChunkSize;
+  }
+
+  /// Conservative worst-case bytes a real STREAM-frame-carrying 1-RTT
+  /// packet adds on top of its own chunk payload: ~10 bytes short
+  /// header (1 first byte + up to 8-byte DCID + up to 4-byte packet
+  /// number -- see [ShortHeader.encode]), ~10 bytes STREAM frame
+  /// varints (type/streamId/offset/length, worst case once offsets
+  /// grow past 2^14), 16 bytes AEAD tag. Matches
+  /// max_stream_frame_chunk_size_test.dart's own worst-case overhead
+  /// constant -- kept in sync deliberately (both derive from the same
+  /// wire format), not re-derived dynamically per packet, since a
+  /// small amount of slack here costs nothing (an actually-smaller
+  /// packet just wastes a few bytes of the confirmed MTU) while
+  /// getting it wrong the other way (using a probe size UP TO its own
+  /// full confirmed value with zero overhead headroom) would risk
+  /// producing a packet larger than what was actually confirmed to
+  /// work.
+  static const int _mtuProbeOverheadBytes = 10 + 10 + 16;
+
+  /// Test-only window into Path MTU Discovery's own current state --
+  /// [QuicStream.write]'s own real behavior (via [_streamChunkSize])
+  /// already depends on this internally; exposed as a public field
+  /// purely so an integration test (which, like every other test in
+  /// this package, imports this library via its own `src/` path
+  /// rather than the public API surface -- see api.dart's own doc
+  /// comment on why the public API itself stays deliberately narrow)
+  /// can assert end-to-end that discovery actually ran and actually
+  /// grew [_streamChunkSize] past the fixed floor against a real
+  /// network path, not just that the isolated state machine in
+  /// mtu_discovery_test.dart behaves correctly.
+  MtuDiscoverer get debugMtuDiscoverer => _mtuDiscoverer;
 
   // ---- Receive-side flow control (RFC 9000 §4) ----
   // The connection-wide limit we advertised in our transport
@@ -574,6 +648,7 @@ class Connection {
     _startPingTimer();
     _startIdleTimeoutTimer();
     _rearmLossDetectionTimer();
+    _mtuDiscoverer.start();
   }
 
   /// Serializes datagram processing: [_onSocketEvent] fires
@@ -957,9 +1032,17 @@ class Connection {
         _congestion.onPacketAcked(acked);
       }
       _noteProbeAcked(result.newlyAcked.map((p) => p.packetNumber));
+      for (final acked in result.newlyAcked) {
+        final probeSize = _inFlightMtuProbes.remove(acked.packetNumber);
+        if (probeSize != null) _mtuDiscoverer.onProbeAcked(probeSize);
+      }
       if (result.newlyLost.isNotEmpty) {
         _congestion.onPacketsLost(
             result.newlyLost.map((l) => l.packet).toList(), DateTime.now());
+        for (final lost in result.newlyLost) {
+          final probeSize = _inFlightMtuProbes.remove(lost.packet.packetNumber);
+          if (probeSize != null) _mtuDiscoverer.onProbeLost(probeSize);
+        }
         await _retransmitLostPackets(result.newlyLost, space: space);
       }
     }
@@ -1587,9 +1670,19 @@ class Connection {
     // DESIGN.md's keepalive requirement: send a PING periodically to
     // hold the connection open against the peer's idle timeout
     // (matches agents/quic_conn.go and server/quic_visitor.go's shared
-    // 10s KeepAlivePeriod).
-    _pingTimer = Timer.periodic(const Duration(seconds: 10),
-        (_) => _guardLocalSend('keepalive ping', _sendPing));
+    // 10s KeepAlivePeriod). Piggybacks MTU probing onto the same timer
+    // (RFC 8899 has no specific cadence requirement -- probing once
+    // per keepalive interval, only while a probe isn't already in
+    // flight and discovery isn't already done, is a reasonable, low-
+    // overhead cadence for a low-bandwidth link per DESIGN.md's scope,
+    // not a throughput-sensitive path that would benefit from probing
+    // more aggressively).
+    _pingTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      _guardLocalSend('keepalive ping', _sendPing);
+      if (_mtuDiscoverer.shouldProbe) {
+        _guardLocalSend('MTU probe', _sendMtuProbe);
+      }
+    });
   }
 
   Future<void> _sendPing() async {
@@ -1618,6 +1711,66 @@ class Connection {
     if (!_probeResolved && _probePingPn == null) {
       _noteProbeSent(packetNumber);
     }
+    _sendDatagram(built.bytes);
+    _rearmLossDetectionTimer();
+  }
+
+  /// RFC 8899 §4.1: sends one PING frame padded with PADDING frames to
+  /// exactly [MtuDiscoverer.nextProbeSize]'s own target UDP payload
+  /// size, to test whether this connection's own path actually
+  /// delivers a datagram that large. Deliberately NOT given any
+  /// [SentPacket.retransmittableFrames] -- unlike an ordinary lost
+  /// packet (RFC 9000 §13.3: retransmit the same DATA in a new
+  /// packet), a lost MTU probe must never be blindly retransmitted at
+  /// the same size (that's exactly what [MtuDiscoverer.onProbeLost]
+  /// itself decides, via [_inFlightMtuProbes]' own ACK/loss routing in
+  /// [_processFrames] -- see that map's own doc comment), so
+  /// [_retransmitLostPackets]'s existing `frames == null` skip already
+  /// does the right thing for a probe with no further code needed
+  /// there.
+  Future<void> _sendMtuProbe() async {
+    if (state != ConnectionState.connected || !_oneRttSpace.keys.hasKeys) {
+      return;
+    }
+    final probeSize = _mtuDiscoverer.nextProbeSize();
+    final packetNumber = _oneRttSpace.allocatePacketNumber();
+    final pnLength = packetNumberEncodingLength(
+        packetNumber, _oneRttSpace.largestAckedPacket);
+
+    // Header bytes: 1 first byte + DCID + packet number. The AEAD seal
+    // adds a fixed 16-byte tag on top of the plaintext payload. Padding
+    // the plaintext (a PingFrame plus enough PaddingFrames) to make the
+    // final protected packet land as close as possible to probeSize is
+    // what actually tests whether the PATH -- not just this library's
+    // own encoding -- tolerates a datagram that size.
+    final headerLength = 1 + _destinationConnectionId.length + pnLength;
+    const aeadTagLength = 16;
+    final targetPlaintextLength =
+        (probeSize - headerLength - aeadTagLength).clamp(1, probeSize);
+    final paddingCount = targetPlaintextLength - 1; // 1 byte for PingFrame
+    final frames = <Frame>[
+      const PingFrame(),
+      for (var i = 0; i < paddingCount; i++) const PaddingFrame(),
+    ];
+
+    final built = await buildShortHeaderPacket(
+      destinationConnectionId: _destinationConnectionId,
+      packetNumber: packetNumber,
+      packetNumberLength: pnLength,
+      keyPhase: _oneRttSendEra().keyPhase,
+      keys: _oneRttSendEra().keys,
+      frames: frames,
+    );
+    _oneRttSpace.lossDetector.onPacketSent(SentPacket(
+      packetNumber: packetNumber,
+      ackEliciting: true,
+      inFlight: true,
+      sentBytes: built.bytes.length,
+      timeSent: DateTime.now(),
+      // No retransmittableFrames -- see this method's own doc comment.
+    ));
+    _congestion.onPacketSent(built.bytes.length);
+    _inFlightMtuProbes[packetNumber] = probeSize;
     _sendDatagram(built.bytes);
     _rearmLossDetectionTimer();
   }
@@ -1798,6 +1951,10 @@ class Connection {
         final lost = space.lossDetector.detectLossOnTimeout(now);
         if (lost.isNotEmpty) {
           _congestion.onPacketsLost(lost.map((l) => l.packet).toList(), now);
+          for (final l in lost) {
+            final probeSize = _inFlightMtuProbes.remove(l.packet.packetNumber);
+            if (probeSize != null) _mtuDiscoverer.onProbeLost(probeSize);
+          }
           await _retransmitLostPackets(lost, space: space);
         }
         _rearmLossDetectionTimer();

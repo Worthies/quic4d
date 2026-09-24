@@ -55,12 +55,17 @@ func main() {
 	}
 	sendWelcome := false
 	acceptSecondStream := false
+	secondStreamEchoAll := false
 	for _, arg := range os.Args[3:] {
 		if arg == "-welcome" {
 			sendWelcome = true
 		}
 		if arg == "-multi" {
 			acceptSecondStream = true
+		}
+		if arg == "-multi-echo-all" {
+			acceptSecondStream = true
+			secondStreamEchoAll = true
 		}
 	}
 
@@ -109,7 +114,11 @@ func main() {
 	}
 
 	if acceptSecondStream {
-		go handleSecondStream(conn)
+		if secondStreamEchoAll {
+			go handleSecondStreamEchoAll(conn)
+		} else {
+			go handleSecondStream(conn)
+		}
 	}
 
 
@@ -201,4 +210,42 @@ func handleSecondStream(conn *quic.Conn) {
 	log.Printf("second stream: sent: %q", reply)
 	time.Sleep(200 * time.Millisecond)
 	stream.Close()
+}
+
+// handleSecondStreamEchoAll accepts exactly one additional
+// bidirectional stream beyond the connection's own control stream and
+// echoes back EVERY byte it ever reads, verbatim, as it arrives --
+// unlike handleSecondStream (which only echoes a single leading tag
+// line), this exercises the real Remote VNC Forwarding data-stream
+// shape: an unbounded, arbitrarily-large binary byte stream with no
+// message framing at all (see leaf server/vnc_relay.go's own doc
+// comment -- once the tag line's own single line is consumed, VNC
+// protocol bytes flow raw and unframed in both directions for the
+// rest of the stream's lifetime). Used by
+// initial_congestion_window_second_stream_test.dart to verify a large
+// binary payload survives a round trip on the SECOND stream
+// specifically (not stream 0, which every other large-payload test in
+// this package already covers) with a non-default
+// initialCongestionWindow in effect -- the actual combination Remote
+// VNC Forwarding's low-bandwidth mode exercises in production.
+func handleSecondStreamEchoAll(conn *quic.Conn) {
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		log.Printf("second stream (echo-all): accept failed: %v", err)
+		return
+	}
+	buf := make([]byte, 65536)
+	for {
+		n, err := stream.Read(buf)
+		if n > 0 {
+			if _, werr := stream.Write(buf[:n]); werr != nil {
+				log.Printf("second stream (echo-all): write failed: %v", werr)
+				return
+			}
+		}
+		if err != nil {
+			log.Printf("second stream (echo-all): read ended: %v", err)
+			return
+		}
+	}
 }

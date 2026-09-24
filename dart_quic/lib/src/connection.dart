@@ -62,28 +62,35 @@ const int kMinimumInitialDatagramSize = 1200;
 /// bytes, one STREAM frame/packet per chunk, matching how every real
 /// QUIC stack paces stream data across multiple packets.
 ///
-/// 1350 (not the original, more conservative 1000) leaves ~50 bytes of
-/// headroom under a conservative 1400-byte safe-MTU assumption (below
-/// the Ethernet/PPPoE-typical 1500, since this path may cross a VPN or
-/// other tunnel that further reduces it, and there is no PMTU discovery
-/// in this library to detect and adapt to a smaller path MTU) for the
-/// short header (~10 bytes: 1 first byte + 8-byte DCID + up to 4-byte
-/// packet number), the STREAM frame's own type/streamId/offset/length
-/// varints (~10 bytes worst case once offsets grow past 2^14), and the
-/// AEAD tag (16 bytes) -- comfortably fits with margin to spare. This
-/// was raised from 1000 specifically because Remote VNC Forwarding
-/// (see PLAN.md's "Remote VNC Forwarding" section) sends FramebufferUpdate
-/// payloads that can be hundreds of KB to several MB per frame, and
-/// every additional STREAM-frame chunk costs one full AES-128-GCM
-/// packet encryption (dart_quic's own AEAD implementation is pure-Dart,
+/// CORRECTION: this was briefly raised to 1350 (see git history) to
+/// cut Remote VNC Forwarding's own per-chunk AEAD/send overhead for a
+/// large FramebufferUpdate payload (dart_quic's own AEAD is pure-Dart,
 /// not hardware/FFI-accelerated -- see protection.dart's own doc
-/// comment) plus one full send -- the fixed per-chunk overhead this
-/// constant controls was measured (see this library's own bench
-/// scripts, not checked in) to dominate total encode time for a
-/// large payload: ~26% fewer chunks at 1350 vs 1000 directly
-/// translates to ~26% less AEAD/send overhead for the exact same
-/// payload.
-const int kMaxStreamFrameChunkSize = 1350;
+/// comment), reasoning that 1350 left headroom under a conservative
+/// 1400-byte "safe MTU" assumption. That assumption was WRONG: this
+/// library implements no Path MTU Discovery at all, so it has no way
+/// to actually learn a path's real MTU, and 1400 bytes is well above
+/// what many real-world tunneled paths (VPNs, corporate proxies,
+/// nested tunnels -- WireGuard commonly ~1420, OpenVPN commonly
+/// ~1350-1400, some nested/multi-hop tunnels well under that) actually
+/// carry without silently dropping the oversized datagram outright --
+/// reproduced live as a real regression: Remote VNC Forwarding's own
+/// low-bandwidth mode (which sends the largest, most tightly-packed
+/// STREAM-frame chunks, since ZRLE compresses a whole frame into one
+/// write() call this constant then slices maximally) went from
+/// "connects" to "connects, then hangs forever and times out" the
+/// moment this constant crossed a real VPN path's own actual MTU --
+/// every maximally-sized packet silently vanished into the tunnel,
+/// and QUIC's own retransmission (which resends the SAME size) could
+/// never recover. Reverted to 1000, matching this library's own
+/// original, proven-safe value -- still comfortably under
+/// [kMinimumInitialDatagramSize] (the one path-MTU floor RFC 9000
+/// §14.1 obligates every compliant QUIC path to support without any
+/// discovery/negotiation), unlike 1350, which was never actually
+/// guaranteed by anything. Revisit only alongside real Path MTU
+/// Discovery (RFC 8899) support, which alone can safely learn whether
+/// a *specific* path tolerates a larger size instead of guessing.
+const int kMaxStreamFrameChunkSize = 1000;
 
 enum ConnectionState { connecting, handshaking, connected, closed }
 

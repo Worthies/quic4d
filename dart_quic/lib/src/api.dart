@@ -121,12 +121,20 @@ class QuicEndpoint {
   /// internally), not only a literal IP:port, so callers don't need
   /// their own DNS resolution step). [serverName] is used for the TLS
   /// ClientHello's SNI/server_name extension.
+  ///
+  /// [initialCongestionWindow], when given, overrides RFC 9002 §7.2's
+  /// own conservative default initial congestion window (~14.7KB) --
+  /// see `CongestionController.initialWindowOverride`'s own doc comment
+  /// (in recovery/congestion_control.dart) for the full rationale. Left
+  /// null (RFC 9002's own default applies) unless the caller has a
+  /// specific reason to trust the path.
   Future<QuicConnection> connect({
     required String addr,
     required String serverName,
     void Function(List<Uint8List> serverCertificateChainDer)?
         onServerCertificateChain,
     Duration handshakeTimeout = const Duration(seconds: 10),
+    int? initialCongestionWindow,
   }) async {
     final parts = _splitHostPort(addr);
     final connection = await impl.Connection.connect(
@@ -136,6 +144,7 @@ class QuicEndpoint {
       clientIdentity: _clientIdentity,
       onServerCertificateChain: onServerCertificateChain,
       handshakeTimeout: handshakeTimeout,
+      initialCongestionWindow: initialCongestionWindow,
     );
     return QuicConnection._(connection);
   }

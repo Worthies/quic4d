@@ -60,12 +60,30 @@ const int kMinimumInitialDatagramSize = 1200;
 /// quic-go-based server (see test/integration/large_write_test.dart).
 /// [write] instead splits [data] into chunks of at most this many
 /// bytes, one STREAM frame/packet per chunk, matching how every real
-/// QUIC stack paces stream data across multiple packets. Deliberately
-/// well under [kMinimumMaxDatagramSize] to leave headroom for the
-/// short header, AEAD tag, and STREAM frame's own type/streamId/
-/// offset/length varints, without needing to compute that overhead
-/// exactly per chunk.
-const int kMaxStreamFrameChunkSize = 1000;
+/// QUIC stack paces stream data across multiple packets.
+///
+/// 1350 (not the original, more conservative 1000) leaves ~50 bytes of
+/// headroom under a conservative 1400-byte safe-MTU assumption (below
+/// the Ethernet/PPPoE-typical 1500, since this path may cross a VPN or
+/// other tunnel that further reduces it, and there is no PMTU discovery
+/// in this library to detect and adapt to a smaller path MTU) for the
+/// short header (~10 bytes: 1 first byte + 8-byte DCID + up to 4-byte
+/// packet number), the STREAM frame's own type/streamId/offset/length
+/// varints (~10 bytes worst case once offsets grow past 2^14), and the
+/// AEAD tag (16 bytes) -- comfortably fits with margin to spare. This
+/// was raised from 1000 specifically because Remote VNC Forwarding
+/// (see PLAN.md's "Remote VNC Forwarding" section) sends FramebufferUpdate
+/// payloads that can be hundreds of KB to several MB per frame, and
+/// every additional STREAM-frame chunk costs one full AES-128-GCM
+/// packet encryption (dart_quic's own AEAD implementation is pure-Dart,
+/// not hardware/FFI-accelerated -- see protection.dart's own doc
+/// comment) plus one full send -- the fixed per-chunk overhead this
+/// constant controls was measured (see this library's own bench
+/// scripts, not checked in) to dominate total encode time for a
+/// large payload: ~26% fewer chunks at 1350 vs 1000 directly
+/// translates to ~26% less AEAD/send overhead for the exact same
+/// payload.
+const int kMaxStreamFrameChunkSize = 1350;
 
 enum ConnectionState { connecting, handshaking, connected, closed }
 
@@ -310,7 +328,7 @@ class Connection {
   late final PacketNumberSpace _initialSpace;
   late final PacketNumberSpace _handshakeSpace;
   late final PacketNumberSpace _oneRttSpace;
-  final CongestionController _congestion = CongestionController();
+  late final CongestionController _congestion;
 
   // ---- Receive-side flow control (RFC 9000 §4) ----
   // The connection-wide limit we advertised in our transport
@@ -417,6 +435,7 @@ class Connection {
     required Uint8List destinationConnectionId,
     required Uint8List sourceConnectionId,
     required ClientHandshake handshake,
+    int? initialCongestionWindow,
   })  : _initialDestinationConnectionId = destinationConnectionId,
         _destinationConnectionId = destinationConnectionId,
         _sourceConnectionId = sourceConnectionId,
@@ -424,6 +443,8 @@ class Connection {
     _initialSpace = PacketNumberSpace(_sharedRtt);
     _handshakeSpace = PacketNumberSpace(_sharedRtt);
     _oneRttSpace = PacketNumberSpace(_sharedRtt);
+    _congestion =
+        CongestionController(initialWindowOverride: initialCongestionWindow);
   }
 
   /// Opens a UDP socket, performs the full QUIC handshake (including
@@ -432,6 +453,15 @@ class Connection {
   /// [onServerCertificateChain] mirrors [ClientHandshake]'s own
   /// callback -- see its doc comment for why chain validation is the
   /// caller's responsibility.
+  ///
+  /// [initialCongestionWindow] overrides RFC 9002 §7.2's own
+  /// conservative default (~14.7KB) -- see
+  /// [CongestionController.initialWindowOverride]'s own doc comment for
+  /// the full rationale (this parameter is the connect()-level entry
+  /// point to it). Left null (RFC 9002's own default applies) unless
+  /// the caller has a specific reason to trust the path, e.g.
+  /// commander's own VNC-forwarding use against its own operator-
+  /// controlled relay.
   static Future<Connection> connect({
     required String host,
     required int port,
@@ -440,6 +470,7 @@ class Connection {
     void Function(List<Uint8List> serverCertificateChainDer)?
         onServerCertificateChain,
     Duration handshakeTimeout = const Duration(seconds: 10),
+    int? initialCongestionWindow,
   }) async {
     final random = Random.secure();
     final destinationConnectionId =
@@ -465,6 +496,7 @@ class Connection {
       destinationConnectionId: destinationConnectionId,
       sourceConnectionId: sourceConnectionId,
       handshake: handshake,
+      initialCongestionWindow: initialCongestionWindow,
     );
 
     await connection._openSocketAndHandshake(

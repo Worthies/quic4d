@@ -13,6 +13,14 @@ const int kMinimumMaxDatagramSize = 1200;
 
 /// RFC 9002 §7.2: initial window is 10x the max datagram size, capped
 /// to the larger of 14,720 bytes or 2x the max datagram size.
+///
+/// RFC 9002 §7.2 itself notes this is a *conservative default*: "a
+/// sender MAY use a larger initial window ... if there is knowledge
+/// that a path likely supports the higher rate" -- see
+/// [CongestionController]'s own `initialWindowOverride` parameter for
+/// where this library takes that option up, specifically for a link
+/// where that knowledge already exists (see that parameter's own doc
+/// comment for the full rationale).
 int initialWindow(int maxDatagramSize) {
   final tenX = 10 * maxDatagramSize;
   final cap = 14720 > (2 * maxDatagramSize) ? 14720 : (2 * maxDatagramSize);
@@ -40,8 +48,41 @@ class CongestionController {
   /// actually had more data queued to send when the window allowed it.
   bool isApplicationLimited = false;
 
-  CongestionController({this.maxDatagramSize = kMinimumMaxDatagramSize}) {
-    congestionWindow = initialWindow(maxDatagramSize);
+  /// Overrides RFC 9002 §7.2's own conservative default initial window
+  /// (see [initialWindow]'s own doc comment on why RFC 9002 explicitly
+  /// permits this for a path the sender already has reason to trust).
+  /// dart_quic's own usage is exactly that case: commander only ever
+  /// speaks QUIC to server/'s own quic-go listener over a link the
+  /// operator already controls end to end (see DESIGN.md's own scope
+  /// note), not an arbitrary Internet path shared with untrusted
+  /// traffic congestion control's slow-start conservatism primarily
+  /// protects against. RFC 9002's own 14,720-byte default (~10-15
+  /// packets at this library's chunk size) forces a large payload --
+  /// e.g. Remote VNC Forwarding's own FramebufferUpdate frames, which
+  /// can be hundreds of KB to several MB (see PLAN.md's "Remote VNC
+  /// Forwarding" section) -- through dozens of "send a small window,
+  /// then WAIT a full round-trip for ACKs before sending more" cycles;
+  /// on a path with non-trivial RTT (routing through server's own
+  /// relay, not a same-LAN hop), that RTT-per-window cost compounds
+  /// into many seconds to tens of seconds of pure waiting for a single
+  /// large frame -- independent of, and additive with, any actual
+  /// encode/decode or encryption cost. A generous fixed override sized
+  /// for "the whole frame fits in the window from the very first RTT"
+  /// removes that wait entirely for the traffic this library actually
+  /// carries, at the accepted cost of behaving less conservatively than
+  /// RFC 9002's own default would on a genuinely congested/lossy path --
+  /// loss detection and the ordinary congestion-avoidance additive-
+  /// increase/multiplicative-decrease behavor (RFC 9002 Appendix B.5/
+  /// B.6, both still fully implemented and untouched by this override)
+  /// still apply and shrink the window the normal way the first time a
+  /// real loss is actually detected.
+  final int? initialWindowOverride;
+
+  CongestionController({
+    this.maxDatagramSize = kMinimumMaxDatagramSize,
+    this.initialWindowOverride,
+  }) {
+    congestionWindow = initialWindowOverride ?? initialWindow(maxDatagramSize);
   }
 
   bool get isInSlowStart => congestionWindow < ssthresh;

@@ -28,6 +28,49 @@ void main() {
       expect(cc.isInSlowStart, isTrue);
       expect(cc.bytesInFlight, 0);
     });
+
+    test(
+        'initialWindowOverride replaces RFC 9002 SS7.2\'s own default '
+        'entirely -- see the field\'s own doc comment for why a caller '
+        'who trusts the path (e.g. commander\'s own operator-controlled '
+        'relay) may want a window far larger than the conservative '
+        '~14.7KB default, so a large payload (a VNC FramebufferUpdate '
+        'can be hundreds of KB to several MB) doesn\'t have to wait '
+        'multiple round trips for the window to grow before it can all '
+        'be sent', () {
+      final cc = CongestionController(initialWindowOverride: 512 * 1024);
+      expect(cc.congestionWindow, equals(512 * 1024));
+      expect(cc.isInSlowStart, isTrue);
+      // canSend must reflect the override immediately -- a payload
+      // that would never fit RFC 9002's own default window fits
+      // comfortably within this one from the very first packet, no
+      // slow-start ramp-up needed.
+      expect(cc.canSend(256 * 1024), isTrue);
+    });
+
+    test('a null initialWindowOverride (the default) falls back to RFC '
+        '9002\'s own conservative initialWindow, unchanged', () {
+      final cc = CongestionController(initialWindowOverride: null);
+      expect(cc.congestionWindow, equals(initialWindow(kMinimumMaxDatagramSize)));
+    });
+
+    test(
+        'initialWindowOverride does not disable loss-driven congestion '
+        'avoidance -- a real loss still halves the window the normal '
+        'way (RFC 9002 SS7.3.2), starting from the overridden value '
+        'instead of the RFC default', () {
+      final cc = CongestionController(initialWindowOverride: 100000);
+      final lostPacket = SentPacket(
+        packetNumber: 1,
+        ackEliciting: true,
+        inFlight: true,
+        sentBytes: 500,
+        timeSent: DateTime(2024, 1, 1),
+      );
+      cc.onPacketSent(500);
+      cc.onPacketsLost([lostPacket], DateTime(2024, 1, 1, 0, 0, 1));
+      expect(cc.congestionWindow, equals(50000));
+    });
   });
 
   group('slow start growth (RFC 9002 SS7.3.1)', () {
